@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 boot_sync_30d.py
-Run on system startup: sync the last 30 days of attendance logs
+Run on system startup: sync the last 60 days of attendance logs
 to the API using sync_all.py logic.
 """
 
@@ -21,7 +21,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("BootSync30d")
+logger = logging.getLogger("BootSync60d")
 
 # ------------- Helpers -------------
 
@@ -82,7 +82,7 @@ def ensure_exec(path: str, what: str):
 def main():
     # Dates
     to_date = datetime.date.today()+datetime.timedelta(days=1)
-    from_date = to_date - datetime.timedelta(days=30)
+    from_date = to_date - datetime.timedelta(days=60)
 
     # Telegram
     config = load_telegram_config()
@@ -125,16 +125,16 @@ def main():
     ]
 
     start_msg = (
-        f"🚀 <b>30-Day Boot Sync Started</b>\n\n"
+        f"🚀 <b>60-Day Boot Sync Started</b>\n\n"
         f"📅 <b>Date Range:</b> {from_date} → {to_date}\n"
-        f"📊 <b>Duration:</b> 30 days\n"
+        f"📊 <b>Duration:</b> 60 days\n"
         f"🔄 <b>Status:</b> Starting historical data sync..."
     )
     tg_send_with_name(notifier, start_msg)
 
     start_time = datetime.datetime.now()
-    logger.info("Starting 30-day boot sync subprocess...")
-    print(f"Running 30-day boot sync: {from_date} -> {to_date}", flush=True)
+    logger.info("Starting 60-day boot sync subprocess...")
+    print(f"Running 60-day boot sync: {from_date} -> {to_date}", flush=True)
 
     # Try once; on failure, wait and retry once
     attempts = 0
@@ -148,7 +148,7 @@ def main():
             # Success
             duration = datetime.datetime.now() - start_time
             ok_msg = (
-                f"✅ <b>30-Day Boot Sync Completed</b>\n\n"
+                f"✅ <b>60-Day Boot Sync Completed</b>\n\n"
                 f"📅 <b>Date Range:</b> {from_date} → {to_date}\n"
                 f"⏱️ <b>Duration:</b> {duration.total_seconds():.1f} seconds\n"
                 f"✅ <b>Status:</b> Historical data sync completed"
@@ -173,7 +173,7 @@ def main():
     # If here, all attempts failed
     duration = datetime.datetime.now() - start_time
     err_msg = (
-        f"❌ <b>30-Day Boot Sync Failed</b>\n\n"
+        f"❌ <b>60-Day Boot Sync Failed</b>\n\n"
         f"📅 <b>Date Range:</b> {from_date} → {to_date}\n"
         f"⏱️ <b>Duration:</b> {duration.total_seconds():.1f} seconds\n"
         f"❌ <b>Status:</b> Historical data sync failed\n"
