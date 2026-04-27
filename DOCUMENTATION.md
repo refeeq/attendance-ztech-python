@@ -856,6 +856,89 @@ sudo systemctl restart attendance-ztech
 
 ---
 
+## 14. Reliability Hardening (April 2026)
+
+> The pipeline was hardened to fix the "some schools randomly miss days
+> until restart" class of bugs. Behavior, config schema, and the ERP
+> contract are unchanged for existing servers — these are internal fixes.
+
+### What changed
+
+| Before | After |
+|---|---|
+| Records lived only in `multiprocessing.Manager().list()`. A crash, kill, or power-loss discarded the buffer. | Records live in a durable **SQLite queue** (`data/attendance_queue.db`, WAL mode). Survives crashes, reboots, power-loss. |
+| Multiple processes called `push_to_server()` concurrently and cleared the whole list — punches added during the HTTP call were silently dropped (lost-update race). | The pusher is a single thread. Records are only marked synced after the ERP confirms a 2xx response. Idempotent enqueue on `(device_id, user_id, timestamp, status, punch)`. |
+| End-of-Day only fired in the exact minute `23:59`. Misses (busy loop, downtime, time drift) meant no catch-up that day. | EoD fires anywhere between `23:55–23:59`, retries every minute on failure, and tracks completion in `sync_state.last_eod_date`. |
+| `last_eod_run_date` was set even when the EoD push failed. | EoD state is set only after a successful run. |
+| Dead device subprocesses were only respawned on the **15-minute** reconnect cycle. | A **watchdog** checks every 30s and respawns dead workers immediately. The 15-minute reconnect remains as a safety net. |
+| `sync_all.py` could fail mid-batch but exit 0, hiding partial failures. `boot_sync_30d.py` then thought the boot sync succeeded. | `sync_all.py` returns exit code `2` on any device or batch failure, so `boot_sync_30d.py` sees the failure and retries / alerts on Telegram. |
+| `main.push_to_server` had no HTTP retries. | Pusher uses configurable retries with exponential backoff. |
+| Telegram could spam the chat with one message per push. | Per-kind throttling on `tg_send` (e.g. success ≤ 1/10 min, failure ≤ 1/5 min). |
+| Log files (`logs/attendance.log`, `log.txt`) grew unbounded. | Rotating log handlers (10 MB × 5 backups). |
+
+### New files
+
+- **`storage.py`** — `AttendanceQueue` (idempotent enqueue, FIFO consume, mark-synced, purge old) and a small `sync_state` KV.
+- **`data/attendance_queue.db`** — created automatically. Add `data/` to your backup if your school requires it; otherwise restarts repopulate from device memory via boot sync + EoD catch-up.
+
+### Optional new `config.json` keys
+
+All optional. Defaults shown. Existing configs work unchanged.
+
+```json
+{
+  "sync": {
+    "db_path": "data/attendance_queue.db",
+    "batch_size": 200,
+    "push_interval_s": 15,
+    "push_timeout_s": 60,
+    "push_retries": 5,
+    "purge_synced_after_days": 14,
+    "watchdog_interval_s": 30,
+    "reconnect_interval_min": 15,
+    "eod_lookback_days": 1,
+    "boot_recovery_days": 3,
+    "boot_sync_days": 60
+  }
+}
+```
+
+| Key | Purpose |
+|---|---|
+| `db_path` | Where the durable SQLite queue lives. |
+| `batch_size` | How many records to push per HTTP request. |
+| `push_interval_s` | How often the pusher polls the queue. |
+| `push_timeout_s` | HTTP timeout per push. |
+| `push_retries` | Retries per push attempt before backing off. |
+| `purge_synced_after_days` | Synced rows are deleted after this many days to keep the DB small. |
+| `watchdog_interval_s` | Cadence of the device-process health check. |
+| `reconnect_interval_min` | Periodic full reconnect cycle (safety net). |
+| `eod_lookback_days` | Daily EoD pulls today + this many prior days (idempotent). |
+| `boot_recovery_days` | At daemon start, run a short EoD pull over this many days. |
+| `boot_sync_days` | Used by `boot_sync_30d.py`; window of historical backfill. |
+
+### Operational notes
+
+- The legacy `buffer_limit` is still honored — if the queue grows above it, the pusher pushes immediately instead of waiting for `push_interval_s`.
+- The ERP payload format is unchanged: `{"Json": [...records...]}`.
+- The Telegram bot/chat config is unchanged. Notifications are now throttled to avoid flooding.
+- `sync_all.py --no-push` enqueues only and lets the daemon drain. Useful for "just refresh from device, daemon will handle ERP."
+- `data/` is gitignored.
+
+### Health checks
+
+Inside the project directory:
+
+```bash
+sqlite3 data/attendance_queue.db \
+  "SELECT 'pending=' || COUNT(*) FROM attendance_queue WHERE synced=0;"
+
+sqlite3 data/attendance_queue.db \
+  "SELECT key, value, updated_at FROM sync_state;"
+```
+
+---
+
 ## Quick Reference Card
 
 | Action | Command |

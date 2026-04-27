@@ -1,70 +1,105 @@
-import asyncio
-import logging
+"""
+main.py
+Attendance ZTech daemon.
+
+Pipeline
+--------
+1. One subprocess per ZKTeco device streams real-time punches into a durable
+   SQLite queue (``storage.AttendanceQueue``). Each subprocess auto-reconnects
+   on any error with exponential backoff and never exits silently.
+2. A background pusher thread drains the queue to the ERP HTTP endpoint with
+   retries + backoff. Records are only marked synced after the ERP confirms
+   a 2xx response, so failures never lose data.
+3. A watchdog respawns dead device subprocesses every ~30s, and a slower
+   "scheduled reconnect" cycle replaces all subprocesses periodically (covers
+   the case where ZKTeco's TCP stack silently drops the live capture).
+4. End-of-Day (23:55-23:59) re-pulls each device's stored punches and
+   re-enqueues them idempotently as a safety net for any RT punches missed
+   by network glitches. Boot recovery does the same with a 3-day lookback
+   if the daemon was offline for a while.
+5. ``boot_sync_30d.py`` (a separate oneshot service at boot time) provides
+   60-day historical backfill via ``sync_all.py``; that path also feeds the
+   same durable queue.
+
+The queue is the single source of truth for "did we ship it?". Restarts,
+crashes, and power-loss never discard pending records.
+"""
+
+from __future__ import annotations
+
 import json
+import logging
 import os
-import sys
-from multiprocessing import Process, Manager
-from multiprocessing.managers import BaseProxy
-from datetime import datetime, date, timedelta
-import time
-from zk import ZK
-import httpx
-from pathlib import Path
-from socket import gethostbyname
+import signal
 import socket
 import subprocess
+import sys
+import threading
+import time
+from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from multiprocessing import Process
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from zk import ZK
+
+from storage import DEFAULT_DB_PATH, AttendanceQueue
 from telegram_notifier import TelegramNotifier
 
-# =========================
-# Helpers: logging & setup
-# =========================
 
-def setup_logging():
-    """Setup comprehensive logging for server/desktop-friendly environments."""
+# ---------------------------------------------------------------------------
+# Logging (rotating files + console)
+# ---------------------------------------------------------------------------
+
+def setup_logging() -> logging.Logger:
     log_dir = Path("logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Desktop logs only if Desktop exists (avoid headless errors)
-    desktop_dir = Path(os.path.expanduser("~/Desktop"))
-    desktop_logs = None
-    if desktop_dir.exists():
-        desktop_logs = desktop_dir / "AttendanceZTech Logs"
-        desktop_logs.mkdir(exist_ok=True)
-
-    main_log = log_dir / "attendance.log"
-    desktop_log = (desktop_logs / "attendance.log") if desktop_logs else None
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
     formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        "%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    logger = logging.getLogger('AttendanceZTech')
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    log = logging.getLogger("AttendanceZTech")
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    log.propagate = False
 
-    fh = logging.FileHandler(main_log, encoding='utf-8')
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    def _add_rotating(path: Path, max_mb: int = 10, backups: int = 5) -> None:
+        try:
+            handler = RotatingFileHandler(
+                str(path),
+                maxBytes=max_mb * 1024 * 1024,
+                backupCount=backups,
+                encoding="utf-8",
+            )
+            handler.setFormatter(formatter)
+            log.addHandler(handler)
+        except Exception as exc:
+            sys.stderr.write(f"[logging] failed to attach {path}: {exc}\n")
 
-    if desktop_log:
-        dh = logging.FileHandler(desktop_log, encoding='utf-8')
-        dh.setLevel(logging.INFO)
-        dh.setFormatter(formatter)
-        logger.addHandler(dh)
+    _add_rotating(log_dir / "attendance.log")
+    _add_rotating(Path("log.txt"), max_mb=10, backups=3)
+
+    desktop = Path(os.path.expanduser("~/Desktop"))
+    if desktop.exists():
+        try:
+            d = desktop / "AttendanceZTech Logs"
+            d.mkdir(exist_ok=True)
+            _add_rotating(d / "attendance.log", max_mb=10, backups=3)
+        except Exception:
+            pass
 
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
     ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    log.addHandler(ch)
+    return log
 
-    local = logging.FileHandler("log.txt", encoding='utf-8')
-    local.setLevel(logging.INFO)
-    local.setFormatter(formatter)
-    logger.addHandler(local)
-
-    return logger
 
 logger = setup_logging()
 logger.info(
@@ -75,67 +110,154 @@ logger.info(
     "======================================="
 )
 
-# =========================
-# Config & Telegram
-# =========================
 
-def load_config():
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.environ.get("ATTENDANCE_CONFIG", "config.json")
+
+
+def load_config() -> dict:
     try:
-        with open("config.json", "r") as f:
-            cfg = json.load(f)
-        return cfg
-    except Exception as e:
-        logger.error(f"Failed to load config.json: {e}")
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.error(f"Failed to load {CONFIG_PATH}: {exc}")
         sys.exit(1)
 
-config = load_config()
-ENDPOINT = config["endpoint"]
-BUFFER_LIMIT = int(config["buffer_limit"])
-DEVICES = config["devices"]
 
-telegram_config = config.get("telegram", {})
-system_name = config.get("name", "Attendance System")
+config = load_config()
+
+ENDPOINT: str = str(config.get("endpoint", "")).strip()
+DEVICES: List[dict] = list(config.get("devices") or [])
+SYSTEM_NAME: str = str(config.get("name", "Attendance System"))
+
+_LOG_LEVEL = str(config.get("log_level", "INFO")).upper()
+try:
+    logger.setLevel(getattr(logging, _LOG_LEVEL))
+except Exception:
+    logger.setLevel(logging.INFO)
+
+# legacy: minimum pending count that triggers an immediate push
+LEGACY_BUFFER_LIMIT = max(1, int(config.get("buffer_limit", 50) or 50))
+
+_SYNC_CFG: dict = config.get("sync") or {}
+PUSH_BATCH_SIZE      = max(1,  int(_SYNC_CFG.get("batch_size", 200)))
+PUSH_INTERVAL_S      = max(1,  int(_SYNC_CFG.get("push_interval_s", 15)))
+PUSH_TIMEOUT_S       = max(5,  int(_SYNC_CFG.get("push_timeout_s", 60)))
+PUSH_RETRIES         = max(1,  int(_SYNC_CFG.get("push_retries", 5)))
+PURGE_DAYS           = max(1,  int(_SYNC_CFG.get("purge_synced_after_days", 14)))
+WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
+RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
+EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
+BOOT_RECOVERY_DAYS   = max(1,  int(_SYNC_CFG.get("boot_recovery_days", 3)))
+DB_PATH              = str(_SYNC_CFG.get("db_path", DEFAULT_DB_PATH))
+
+if not ENDPOINT:
+    logger.error("config.json missing 'endpoint'. Refusing to start.")
+    sys.exit(1)
+if not DEVICES:
+    logger.error("config.json has no devices configured. Refusing to start.")
+    sys.exit(1)
+
+_telegram_cfg = config.get("telegram", {}) or {}
 telegram_notifier = TelegramNotifier(
-    bot_token=telegram_config.get("bot_token", ""),
-    chat_id=telegram_config.get("chat_id", ""),
-    enabled=telegram_config.get("enabled", False),
-    notification_settings=telegram_config.get("notifications", {}),
-    system_name=system_name
+    bot_token=_telegram_cfg.get("bot_token", ""),
+    chat_id=_telegram_cfg.get("chat_id", ""),
+    enabled=bool(_telegram_cfg.get("enabled", False)),
+    notification_settings=_telegram_cfg.get("notifications", {}),
+    system_name=SYSTEM_NAME,
 )
 
-logger.info(f"Configured devices: {len(DEVICES)} | Endpoint: {ENDPOINT} | Buffer limit: {BUFFER_LIMIT} | Telegram: {'ENABLED' if telegram_notifier.enabled else 'DISABLED'}")
+logger.info(
+    f"Config: devices={len(DEVICES)} endpoint={ENDPOINT} "
+    f"batch_size={PUSH_BATCH_SIZE} push_interval_s={PUSH_INTERVAL_S} "
+    f"reconnect_interval_s={RECONNECT_INTERVAL_S} db={DB_PATH} "
+    f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
+)
 
-# =========================
+
+# ---------------------------------------------------------------------------
+# Telegram (with per-kind throttling so the chat never floods)
+# ---------------------------------------------------------------------------
+
+_tg_lock = threading.Lock()
+_tg_last_sent: Dict[str, float] = {}
+
+
+def tg_send(
+    message: str,
+    *,
+    kind: str = "default",
+    min_interval_s: int = 0,
+    retries: int = 3,
+    backoff_s: int = 2,
+) -> None:
+    """Send a Telegram message, prefixing with the system name once.
+
+    ``min_interval_s`` throttles by ``kind`` so high-frequency events
+    (per-batch push, per-watchdog respawn) cannot spam the chat.
+    """
+    if not telegram_notifier.enabled:
+        return
+    if min_interval_s > 0:
+        with _tg_lock:
+            now = time.time()
+            last = _tg_last_sent.get(kind, 0.0)
+            if now - last < min_interval_s:
+                return
+            _tg_last_sent[kind] = now
+
+    if "<b>" in message and f"{SYSTEM_NAME} -" not in message:
+        message = message.replace("<b>", f"<b>{SYSTEM_NAME} - ", 1)
+
+    for i in range(retries):
+        try:
+            telegram_notifier.send_message_sync(message)
+            return
+        except Exception as exc:
+            logger.warning(
+                f"Telegram send failed (attempt {i + 1}/{retries}): {exc}"
+            )
+            time.sleep(backoff_s * (i + 1))
+
+
+# ---------------------------------------------------------------------------
 # Network readiness helpers
-# =========================
+# ---------------------------------------------------------------------------
 
-def wait_for_network(max_wait_s=120):
-    """
-    Wait until DNS & outbound connectivity work.
-    """
+def wait_for_network(max_wait_s: int = 120) -> bool:
+    """Best-effort: return True as soon as any common host is reachable."""
     start = time.time()
     while time.time() - start < max_wait_s:
-        try:
-            # DNS check (telegram and a public host)
-            gethostbyname("api.telegram.org")
-            gethostbyname("google.com")
-            # Outbound TCP check
-            with socket.create_connection(("8.8.8.8", 53), timeout=3):
-                return True
-        except OSError:
-            time.sleep(3)
+        for host, port in (
+            ("api.telegram.org", 443),
+            ("google.com", 443),
+            ("1.1.1.1", 53),
+            ("8.8.8.8", 53),
+        ):
+            try:
+                with socket.create_connection((host, port), timeout=3):
+                    return True
+            except OSError:
+                continue
+        time.sleep(3)
     return False
 
-def any_device_ping_ok(hosts, max_wait_s=60):
-    """
-    Wait until at least one device answers ping (best-effort; do not fail hard).
-    """
+
+def any_device_ping_ok(hosts: List[str], max_wait_s: int = 60) -> bool:
     start = time.time()
     while time.time() - start < max_wait_s:
         for h in hosts:
+            if not h:
+                continue
             try:
-                rc = subprocess.call(["ping", "-c", "1", "-W", "1", h],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                rc = subprocess.call(
+                    ["ping", "-c", "1", "-W", "1", h],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 if rc == 0:
                     return True
             except Exception:
@@ -143,461 +265,632 @@ def any_device_ping_ok(hosts, max_wait_s=60):
         time.sleep(3)
     return False
 
-def host_port_reachable(host, port, timeout=3):
+
+# ---------------------------------------------------------------------------
+# Queue (parent-side instance)
+# ---------------------------------------------------------------------------
+
+queue = AttendanceQueue(DB_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _safe_password(device: dict) -> int:
+    """Coerce a config password into an int; pyzk expects an int."""
+    pw = device.get("password", 0)
+    if isinstance(pw, str):
+        if not pw:
+            return 0
+        try:
+            return int(pw)
+        except ValueError:
+            return 0
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+        return int(pw or 0)
+    except Exception:
+        return 0
 
-# =========================
-# Telegram (safe send)
-# =========================
 
-def tg_send_safe(html_text: str, retries=3, backoff_s=2):
-    """
-    Send a Telegram message, but don't crash if network/DNS is not ready.
-    """
-    if not telegram_notifier.enabled:
-        return
-    for i in range(retries):
+def _record_from_zk(log_obj: Any, device_id: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return {
+            "device_id": int(device_id),
+            "user_id": int(log_obj.user_id),
+            "timestamp": log_obj.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": int(getattr(log_obj, "status", 0) or 0),
+            "punch": int(getattr(log_obj, "punch", 0) or 0),
+        }
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ERP push
+# ---------------------------------------------------------------------------
+
+def push_with_retries(
+    records: List[dict],
+    retries: Optional[int] = None,
+    timeout: Optional[int] = None,
+) -> Tuple[bool, Optional[str]]:
+    """POST records to the ERP. Returns (ok, last_error)."""
+    if not records:
+        return True, None
+    retries = retries or PUSH_RETRIES
+    timeout = timeout or PUSH_TIMEOUT_S
+    payload = {"Json": records}
+    delay = 2
+    last_err: Optional[str] = None
+    for attempt in range(1, retries + 1):
         try:
-            telegram_notifier.send_message_sync(html_text)
-            return
-        except Exception as e:
-            logger.error(f"Telegram send failed (attempt {i+1}/{retries}): {e}")
-            time.sleep(backoff_s * (i + 1))
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(
+                    ENDPOINT,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+            if 200 <= resp.status_code < 300:
+                return True, None
+            last_err = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            logger.warning(
+                f"Push got {resp.status_code} (attempt {attempt}/{retries})"
+            )
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                f"Push exception (attempt {attempt}/{retries}): {exc}"
+            )
+        if attempt < retries:
+            time.sleep(min(delay, 60))
+            delay = min(delay * 2, 60)
+    return False, last_err
 
-def tg_send_with_name(message: str, retries=3, backoff_s=2):
-    """
-    Send a Telegram message with system name prefix.
-    """
-    if not telegram_notifier.enabled:
-        return
-    # Add system name to the message if it's not already there
-    if f"{system_name} -" not in message and "<b>" in message:
-        # Find the first <b> tag and add system name
-        message = message.replace("<b>", f"<b>{system_name} - ", 1)
-    tg_send_safe(message, retries, backoff_s)
 
-# =========================
-# JSON/proxy conversion
-# =========================
+def pusher_loop(stop_event: threading.Event) -> None:
+    """Drain the queue to the ERP. Runs as a daemon thread in main process."""
+    logger.info("📤 Pusher thread started")
+    last_push_attempt = 0.0
+    last_purge = 0.0
+    consecutive_failures = 0
 
-def _to_plain(obj):
-    """
-    Deep-convert Manager proxies (ListProxy/DictProxy etc.), tuples, and datetimes
-    into plain JSON-serializable Python types.
-    """
-    # Proxy -> list/dict/str
-    if isinstance(obj, BaseProxy):
-        # try list-like first
+    while not stop_event.is_set():
         try:
-            obj = list(obj)
-        except Exception:
+            now = time.time()
+
             try:
-                obj = dict(obj)
-            except Exception:
-                return str(obj)
+                pending = queue.count_unsynced()
+            except Exception as exc:
+                logger.error(f"Pusher: count_unsynced failed: {exc}")
+                stop_event.wait(timeout=5)
+                continue
 
-    if isinstance(obj, dict):
-        return {k: _to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_plain(x) for x in obj]
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    return obj
+            if pending == 0:
+                if now - last_purge >= 3600:
+                    try:
+                        deleted = queue.purge_synced_older_than(PURGE_DAYS)
+                        if deleted:
+                            logger.info(
+                                f"🧽 Purged {deleted} synced records "
+                                f"older than {PURGE_DAYS}d"
+                            )
+                    except Exception as exc:
+                        logger.warning(f"Purge error: {exc}")
+                    last_purge = now
+                stop_event.wait(timeout=1.0)
+                continue
 
-# =========================
-# Logging helpers
-# =========================
-
-def log_device_status(device, status, details=""):
-    msg = f"Device {device['device_id']} ({device['ip_address']}:{device['port']}) - {status}"
-    if details:
-        msg += f" - {details}"
-    logger.info(msg)
-
-# =========================
-# Push to server
-# =========================
-
-def push_to_server(attendance_buffer, device_id=None):
-    """
-    Push attendance data to the server.
-    Accepts Manager().list() or a normal list.
-    - Deep-converts any proxies/nested proxies to plain types.
-    - Clears buffer in-place only on success.
-    """
-    # Materialize to a plain list of dicts (handles ListProxy + nested proxies)
-    records_plain = _to_plain(attendance_buffer)
-    if not records_plain:
-        return True
-
-    payload = {"Json": records_plain}
-    record_count = len(records_plain)
-
-    logger.info(f"Pushing {record_count} records to {ENDPOINT}")
-    try:
-        with httpx.Client(timeout=50) as client:
-            resp = client.post(
-                ENDPOINT,
-                json=payload,  # already plain JSON-ables
-                headers={"Content-Type": "application/json"},
+            should_push = (
+                pending >= LEGACY_BUFFER_LIMIT
+                or (now - last_push_attempt >= PUSH_INTERVAL_S)
             )
-        if resp.status_code == 200:
-            logger.info(f"✅ Push success ({record_count} records)")
-            tg_send_with_name(
-                f"✅ <b>Data Push Success</b>\n\n"
-                f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"🧾 <b>Records:</b> {record_count}\n"
-                f"✅ <b>Status:</b> Uploaded"
-            )
-            # Clear only after success
+            if not should_push:
+                stop_event.wait(timeout=1.0)
+                continue
+
+            last_push_attempt = now
+
             try:
-                if isinstance(attendance_buffer, BaseProxy):
-                    attendance_buffer[:] = []
-                else:
-                    attendance_buffer.clear()
-            except Exception:
-                pass
-            return True
-        else:
-            logger.error(f"❌ Push failed HTTP {resp.status_code}: {resp.text[:500]}")
-            tg_send_with_name(
-                f"❌ <b>Data Push Failed</b>\n\n"
-                f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"🧾 <b>Records:</b> {record_count}\n"
-                f"❌ <b>Status:</b> HTTP {resp.status_code}"
-            )
-            return False
-    except Exception as e:
-        logger.error(f"❌ Push error: {e}")
-        tg_send_with_name(
-            f"❌ <b>Data Push Error</b>\n\n"
-            f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🧾 <b>Records:</b> {record_count}\n"
-            f"❌ <b>Error:</b> {str(e)}"
-        )
-        return False
+                records = queue.fetch_unsynced(PUSH_BATCH_SIZE)
+            except Exception as exc:
+                logger.error(f"Pusher: fetch_unsynced failed: {exc}")
+                stop_event.wait(timeout=5)
+                continue
 
-# =========================
-# End-of-day collection
-# =========================
+            if not records:
+                continue
 
-def fetch_end_of_day_logs(device):
-    """
-    Fetch current day's attendance logs from a device and push them.
-    Best-effort: logs errors but continues.
-    """
-    logger.info(f"🧹 Starting EoD fetch for device {device['device_id']}")
-
-    try:
-        zk = ZK(
-            device["ip_address"],
-            port=device["port"],
-            timeout=100,
-             password=device.get("password", 0),
-            force_udp=False,
-            ommit_ping=False,
-        )
-        log_device_status(device, "Connecting for EoD logs...")
-        conn = zk.connect()
-        if not conn:
-            log_device_status(device, "Failed to connect", "None returned")
-            return
-
-        try:
-            conn.enable_device()
-            log_device_status(device, "Connected", "Fetching logs...")
-            logs = conn.get_attendance()
-            if not logs:
-                logger.info(f"ℹ️ No attendance logs found for device {device['device_id']}")
-                return
-
-            today = datetime.now().strftime("%Y-%m-%d")
-            attendance_data = [
+            ids = [r["id"] for r in records]
+            payload = [
                 {
-                    "device_id": device["device_id"],
-                    "user_id": int(log.user_id),
-                    "timestamp": log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": log.status,
-                    "punch": log.punch,
+                    "device_id": r["device_id"],
+                    "user_id": r["user_id"],
+                    "timestamp": r["timestamp"],
+                    "status": r["status"],
+                    "punch": r["punch"],
                 }
-                for log in logs
-                if log.timestamp.strftime("%Y-%m-%d") == today
+                for r in records
             ]
 
-            logger.info(f"📊 EoD {device['device_id']}: {len(attendance_data)} records for {today}")
-            if attendance_data:
-                ok = push_to_server(attendance_data, device['device_id'])
-                if ok:
-                    logger.info(f"✅ EoD push OK for device {device['device_id']}")
-                    tg_send_with_name(
-                        f"🧹 <b>End-of-Day Push</b>\n\n"
-                        f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"🖥️ <b>Device:</b> {device['device_id']}\n"
-                        f"🧾 <b>Records:</b> {len(attendance_data)}\n"
-                        f"✅ <b>Status:</b> Uploaded"
+            ok, err = push_with_retries(payload)
+            if ok:
+                try:
+                    queue.mark_synced(ids)
+                except Exception as exc:
+                    logger.error(
+                        f"Pusher: mark_synced failed (will retry): {exc}"
                     )
-                else:
-                    logger.error(f"❌ EoD push failed for device {device['device_id']}")
-                    tg_send_with_name(
-                        f"❌ <b>EoD Push Failed</b>\n\n"
-                        f"🖥️ <b>Device:</b> {device['device_id']}\n"
-                        f"🧾 <b>Records:</b> {len(attendance_data)}"
-                    )
-            else:
-                logger.info(f"ℹ️ No logs today for device {device['device_id']}")
-                tg_send_with_name(
-                    f"ℹ️ <b>No EoD Data</b>\n\n"
-                    f"🖥️ <b>Device:</b> {device['device_id']}\n"
-                    f"🧾 <b>Records:</b> 0"
+                    stop_event.wait(timeout=5)
+                    continue
+
+                logger.info(
+                    f"✅ Synced {len(ids)} records "
+                    f"(pending after: {max(0, pending - len(ids))})"
                 )
-        finally:
-            try:
-                conn.enable_device()
-                conn.disconnect()
-                log_device_status(device, "Disconnected after EoD")
-            except Exception as de:
-                logger.warning(f"⚠️ Disconnect failed {device['device_id']}: {de}")
-    except Exception as e:
-        log_device_status(device, "Error during EoD fetch", str(e))
-        logger.error(f"❌ EoD error {device['device_id']}: {e}")
+                if consecutive_failures > 0:
+                    tg_send(
+                        f"✅ <b>Sync Recovered</b>\n"
+                        f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                        f"🧾 Records: {len(ids)}\n"
+                        f"📦 Pending: {max(0, pending - len(ids))}",
+                        kind="recovery",
+                        min_interval_s=60,
+                    )
+                consecutive_failures = 0
+                tg_send(
+                    f"✅ <b>Sync OK</b>\n"
+                    f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                    f"🧾 Records: {len(ids)}",
+                    kind="push_success",
+                    min_interval_s=600,
+                )
+            else:
+                try:
+                    queue.mark_attempt_failed(ids, str(err))
+                except Exception as exc2:
+                    logger.error(f"Pusher: mark_attempt_failed error: {exc2}")
+                consecutive_failures += 1
+                logger.error(
+                    f"❌ Sync failed (attempt #{consecutive_failures}, "
+                    f"pending={pending}): {err}"
+                )
+                tg_send(
+                    f"❌ <b>Sync Failed</b>\n"
+                    f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                    f"📦 Pending: {pending}\n"
+                    f"🔧 {str(err)[:200]}",
+                    kind="push_failure",
+                    min_interval_s=300,
+                )
+                # Cool-off so we don't hammer a broken endpoint.
+                cool_off = min(60, 5 + 5 * min(consecutive_failures, 6))
+                stop_event.wait(timeout=cool_off)
+        except Exception as exc:
+            logger.exception(f"Pusher loop unexpected error: {exc}")
+            stop_event.wait(timeout=5)
 
-def end_of_day_task():
-    logger.info("🧹 Starting EoD task for all devices...")
-    tg_send_with_name(
-        f"🧹 <b>Starting End-of-Day</b>\n\n"
-        f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"🖥️ <b>Devices:</b> {len(DEVICES)}"
-    )
-    ok, fail = 0, 0
-    for d in DEVICES:
+    logger.info("📤 Pusher thread stopped")
+
+
+# ---------------------------------------------------------------------------
+# Per-device real-time capture (subprocess target)
+# ---------------------------------------------------------------------------
+
+def capture_real_time_logs(device: dict, db_path: str) -> None:
+    """Connect to a single ZKTeco device and stream punches into the queue.
+
+    Runs as a daemon subprocess. Wrapped in a never-die outer loop so a
+    single ZK / network hiccup does not silently kill capture; the parent
+    watchdog also respawns the process if it ever exits.
+    """
+    sub_logger = logging.getLogger("AttendanceZTech")
+    if not sub_logger.handlers:                       # spawn-mode children
+        setup_logging()
+        sub_logger = logging.getLogger("AttendanceZTech")
+
+    device_id = device.get("device_id", "?")
+    ip = device.get("ip_address", "?")
+    port = int(device.get("port", 4370) or 4370)
+    pwd = _safe_password(device)
+    local_queue = AttendanceQueue(db_path)
+
+    backoff = 5
+    while True:
+        conn = None
         try:
-            fetch_end_of_day_logs(d)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            logger.error(f"❌ EoD task error for device {d['device_id']}: {e}")
-            tg_send_with_name(
-                f"❌ <b>Device Error (EoD)</b>\n\n"
-                f"🖥️ <b>Device:</b> {d['device_id']}\n"
-                f"❌ <b>Error:</b> {str(e)}"
+            sub_logger.info(f"🔌 [dev {device_id}] Connecting to {ip}:{port}")
+            zk = ZK(
+                ip,
+                port=port,
+                timeout=50,
+                password=pwd,
+                force_udp=False,
+                ommit_ping=False,
             )
-    tg_send_with_name(
-        f"🧹 <b>EoD Complete</b>\n\n"
-        f"✅ <b>OK:</b> {ok}\n"
-        f"❌ <b>Failed:</b> {fail}\n"
-        f"🖥️ <b>Total:</b> {len(DEVICES)}"
-    )
-    logger.info("🧹 EoD task complete.")
-
-# =========================
-# Real-time capture
-# =========================
-
-def capture_real_time_logs(device, shared_buffer, periodic_flush_s=60):
-    """
-    Process: connect to device and stream logs into shared_buffer.
-    Periodically flush to server even if BUFFER_LIMIT not reached.
-    """
-    device_id = device['device_id']
-    ip_address = device['ip_address']
-    port = device['port']
-
-    logger.info(f"🔌 Starting RT capture for device {device_id} ({ip_address}:{port})")
-    last_flush = time.time()
-
-    try:
-        zk = ZK(ip_address, port=port, timeout=50, password=device.get("password", 0))
-        log_device_status(device, "Connecting for RT capture...")
-        conn = zk.connect()
-        if not conn:
-            log_device_status(device, "Failed to connect", "None returned")
-            return
-
-        try:
+            conn = zk.connect()
+            if not conn:
+                raise RuntimeError("connect() returned None")
             conn.enable_device()
-            log_device_status(device, "Connected", "Real-time capture active")
-
-            # Optional: log device info
-            try:
-                info = conn.get_device_info()
-                logger.info(f"ℹ️ Device {device_id} info: {info}")
-            except Exception:
-                logger.info(f"ℹ️ Device {device_id} connected (info unavailable)")
+            sub_logger.info(
+                f"✅ [dev {device_id}] Connected, entering live capture"
+            )
+            backoff = 5
 
             for attendance in conn.live_capture():
-                # live_capture can yield None; still tick periodic flush
-                now = time.time()
-
-                if attendance:
-                    log_entry = {
-                        "device_id": device_id,
-                        "user_id": int(attendance.user_id),
-                        "timestamp": attendance.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": attendance.status,
-                        "punch": attendance.punch,
-                    }
-                    logger.info(f"🕘 New attendance: user {attendance.user_id} @ {log_entry['timestamp']} (Dev {device_id})")
-                    shared_buffer.append(log_entry)
-
-                    # size-based flush
-                    if len(shared_buffer) >= BUFFER_LIMIT:
-                        logger.info(f"📤 Buffer ≥ {BUFFER_LIMIT}, pushing...")
-                        push_to_server(shared_buffer, device_id)
-
-                # time-based flush
-                if now - last_flush >= periodic_flush_s and len(shared_buffer) > 0:
-                    logger.info(f"⏱️ Periodic flush ({len(shared_buffer)} recs)")
-                    push_to_server(shared_buffer, device_id)
-                    last_flush = now
-
+                if attendance is None:
+                    continue
+                record = _record_from_zk(attendance, device_id)
+                if record is None:
+                    sub_logger.warning(
+                        f"⚠️ [dev {device_id}] skip malformed attendance"
+                    )
+                    continue
+                try:
+                    if local_queue.enqueue_one(record):
+                        sub_logger.info(
+                            f"🕘 [dev {device_id}] punch user="
+                            f"{record['user_id']} @ {record['timestamp']}"
+                        )
+                except Exception as exc:
+                    sub_logger.error(
+                        f"❌ [dev {device_id}] enqueue failed: {exc}"
+                    )
+        except Exception as exc:
+            sub_logger.error(
+                f"❌ [dev {device_id}] capture error: {exc}; "
+                f"reconnecting in {backoff}s"
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
         finally:
-            try:
-                conn.enable_device()
-                conn.disconnect()
-                log_device_status(device, "Disconnected from RT capture")
-            except Exception as de:
-                logging.warning(f"⚠️ Disconnect failed {device['device_id']}: {de}")
+            if conn is not None:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
 
-    except Exception as e:
-        log_device_status(device, "Error during RT capture", str(e))
-        logger.error(f"❌ RT capture error dev {device_id}: {e}")
 
-# =========================
-# Process orchestration
-# =========================
+# ---------------------------------------------------------------------------
+# End-of-Day reconciliation (catches RT punches missed by network glitches)
+# ---------------------------------------------------------------------------
 
-def reconnect_devices(shared_buffer):
-    """
-    Spawn one process per device for RT capture.
-    """
-    logger.info("🔁 Spawning RT capture processes...")
-    processes = []
+def _eod_one_device(device: dict, target_dates: set) -> int:
+    device_id = device.get("device_id", "?")
+    ip = device.get("ip_address", "?")
+    port = int(device.get("port", 4370) or 4370)
+    pwd = _safe_password(device)
+
+    logger.info(f"🧹 [dev {device_id}] EoD pull from {ip}:{port}")
+    zk = ZK(
+        ip,
+        port=port,
+        timeout=100,
+        password=pwd,
+        force_udp=False,
+        ommit_ping=False,
+    )
+    conn = zk.connect()
+    if not conn:
+        raise RuntimeError("connect() returned None")
+    try:
+        conn.enable_device()
+        logs = conn.get_attendance() or []
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+    if not logs:
+        logger.info(f"ℹ️ [dev {device_id}] No logs found")
+        return 0
+
+    records: List[Dict[str, Any]] = []
+    for log in logs:
+        try:
+            ts_date = log.timestamp.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        if ts_date not in target_dates:
+            continue
+        rec = _record_from_zk(log, device_id)
+        if rec is not None:
+            records.append(rec)
+
+    new_count = queue.enqueue_many(records)
+    logger.info(
+        f"🧹 [dev {device_id}] EoD scanned={len(logs)} "
+        f"matched={len(records)} new={new_count}"
+    )
+    return new_count
+
+
+def end_of_day_task(lookback_days: Optional[int] = None) -> bool:
+    lookback = max(1, int(lookback_days or EOD_LOOKBACK_DAYS))
+    today = date.today()
+    target_dates = {
+        (today - timedelta(days=i)).isoformat() for i in range(lookback)
+    }
+    logger.info(
+        f"🧹 EoD start (lookback={lookback}d, dates={sorted(target_dates)})"
+    )
+    tg_send(
+        f"🧹 <b>End-of-Day Started</b>\n"
+        f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"🖥️ Devices: {len(DEVICES)}\n"
+        f"📅 Lookback: {lookback}d",
+        kind="eod_start",
+        min_interval_s=60,
+    )
+
+    ok = 0
+    fail = 0
+    total_new = 0
     for d in DEVICES:
-        logger.info(f"▶️ Starting process for device {d['device_id']}")
-        p = Process(target=capture_real_time_logs, args=(d, shared_buffer))
-        p.start()
-        processes.append(p)
-        logger.info(f"✅ Process started dev {d['device_id']} (PID {p.pid})")
-    logger.info(f"✅ All {len(processes)} device processes started")
-    return processes
+        try:
+            total_new += _eod_one_device(d, target_dates)
+            ok += 1
+        except Exception as exc:
+            fail += 1
+            logger.error(
+                f"❌ EoD device {d.get('device_id')} error: {exc}"
+            )
 
-def stop_processes(processes, join_timeout=5):
-    for p in processes:
+    tg_send(
+        f"🧹 <b>End-of-Day Complete</b>\n"
+        f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"✅ OK devices: {ok}\n"
+        f"❌ Failed devices: {fail}\n"
+        f"🧾 New records enqueued: {total_new}",
+        kind="eod_done",
+        min_interval_s=60,
+    )
+    return fail == 0
+
+
+# ---------------------------------------------------------------------------
+# Process supervisor / watchdog
+# ---------------------------------------------------------------------------
+
+def spawn_capture_process(device: dict) -> Process:
+    p = Process(
+        target=capture_real_time_logs,
+        args=(device, DB_PATH),
+        name=f"capture-{device.get('device_id')}",
+        daemon=True,
+    )
+    p.start()
+    logger.info(
+        f"▶️ Capture process started for device "
+        f"{device.get('device_id')} (PID {p.pid})"
+    )
+    return p
+
+
+def supervise_processes(processes: Dict[Any, Process]) -> None:
+    """Restart any device subprocess that has died."""
+    for d in DEVICES:
+        did = d.get("device_id")
+        p = processes.get(did)
+        if p is None or not p.is_alive():
+            if p is not None:
+                exitcode = p.exitcode
+                logger.warning(
+                    f"🩺 Watchdog: device {did} not alive "
+                    f"(exitcode={exitcode}); respawning"
+                )
+                tg_send(
+                    f"⚠️ <b>Worker Restarted</b>\n"
+                    f"🖥️ Device: {did}\n"
+                    f"🔧 Exit: {exitcode}",
+                    kind=f"worker_restart_{did}",
+                    min_interval_s=300,
+                )
+                try:
+                    p.terminate()
+                    p.join(timeout=5)
+                except Exception:
+                    pass
+            try:
+                processes[did] = spawn_capture_process(d)
+            except Exception as exc:
+                logger.error(
+                    f"❌ Failed to spawn capture for device {did}: {exc}"
+                )
+
+
+def stop_processes(
+    processes: Dict[Any, Process], timeout: int = 5
+) -> None:
+    for _did, p in list(processes.items()):
         try:
             p.terminate()
         except Exception:
             pass
-    for p in processes:
+    for _did, p in list(processes.items()):
         try:
-            p.join(timeout=join_timeout)
+            p.join(timeout=timeout)
         except Exception:
             pass
 
-# =========================
-# Main
-# =========================
 
-def main():
-    logger.info("🚀 Boot checks: waiting for network/DNS...")
+# ---------------------------------------------------------------------------
+# Boot recovery (rate-limited so a crash-loop doesn't thrash the devices)
+# ---------------------------------------------------------------------------
+
+def maybe_run_boot_recovery() -> None:
+    last_recovery = queue.get_state("last_boot_recovery_at")
+    if last_recovery:
+        try:
+            last_dt = datetime.fromisoformat(last_recovery)
+            if datetime.now() - last_dt < timedelta(minutes=30):
+                logger.info(
+                    f"⚙️ Skipping boot recovery (last ran {last_recovery})"
+                )
+                return
+        except Exception:
+            pass
+
+    logger.info(
+        f"⚙️ Boot EoD recovery (lookback={BOOT_RECOVERY_DAYS}d)"
+    )
+    try:
+        end_of_day_task(lookback_days=BOOT_RECOVERY_DAYS)
+    except Exception as exc:
+        logger.exception(f"Boot recovery error: {exc}")
+    finally:
+        try:
+            queue.set_state(
+                "last_boot_recovery_at",
+                datetime.now().replace(microsecond=0).isoformat(),
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    logger.info("🚀 Boot checks: waiting for network...")
     if not wait_for_network(120):
-        logger.warning("Network/DNS not ready after 120s; continuing anyway...")
+        logger.warning("Network/DNS not ready after 120s; continuing anyway")
     else:
-        logger.info("✅ Network/DNS looks OK")
+        logger.info("✅ Network/DNS OK")
 
-    device_hosts = [d["ip_address"] for d in DEVICES]
-    logger.info("🔎 Waiting for at least one device to respond to ping...")
+    device_hosts = [d.get("ip_address") for d in DEVICES if d.get("ip_address")]
+    logger.info("🔎 Waiting for at least one device to ping...")
     if not any_device_ping_ok(device_hosts, 60):
-        logger.warning("No devices responded to ping within 60s; continuing anyway...")
+        logger.warning("No devices answered ping in 60s; continuing anyway")
     else:
-        logger.info("✅ Ping OK for at least one device")
+        logger.info("✅ At least one device reachable")
 
-    tg_send_with_name(
-        f"🚀 <b>Attendance ZTech Started</b>\n\n"
-        f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"🖥️ <b>Devices:</b> {len(DEVICES)}\n"
-        f"🌐 <b>Endpoint:</b> {ENDPOINT}\n"
-        f"📦 <b>Buffer:</b> {BUFFER_LIMIT}"
+    try:
+        pending_at_boot = queue.count_unsynced()
+    except Exception:
+        pending_at_boot = -1
+
+    tg_send(
+        f"🚀 <b>Attendance ZTech Started</b>\n"
+        f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"🖥️ Devices: {len(DEVICES)}\n"
+        f"🌐 Endpoint: {ENDPOINT}\n"
+        f"📦 Pending records: {pending_at_boot}",
+        kind="boot",
     )
 
-    with Manager() as manager:
-        shared_buffer = manager.list()
-        logger.info("🧺 Shared buffer ready")
+    stop_event = threading.Event()
 
-        processes = reconnect_devices(shared_buffer)
-        logger.info("🔗 Initial device connections done")
+    def _signal(sig, _frame):
+        logger.info(f"⏹️ Signal {sig} received; shutting down")
+        stop_event.set()
 
-        last_reconnect = time.time()
-        last_eod_run_date = None  # ensure EoD runs once/day
-
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            logger.info("⏰ Entering main loop...")
-            while True:
-                now = datetime.now()
+            signal.signal(sig, _signal)
+        except Exception:
+            pass
 
-                # Scheduled reconnect every 15 minutes
-                if time.time() - last_reconnect >= 15 * 60:
-                    logger.info("🔁 Scheduled 15-min reconnect...")
+    pusher = threading.Thread(
+        target=pusher_loop, args=(stop_event,), name="pusher", daemon=True
+    )
+    pusher.start()
+
+    processes: Dict[Any, Process] = {}
+    supervise_processes(processes)
+
+    maybe_run_boot_recovery()
+
+    last_reconnect = time.time()
+    last_watchdog = 0.0
+    last_eod_attempt = 0.0
+    last_eod_done_marker: Optional[str] = queue.get_state("last_eod_date")
+
+    try:
+        logger.info("⏰ Entering main loop")
+        while not stop_event.is_set():
+            try:
+                now = time.time()
+                now_dt = datetime.now()
+                today_iso = date.today().isoformat()
+
+                if now - last_watchdog >= WATCHDOG_INTERVAL_S:
+                    supervise_processes(processes)
+                    last_watchdog = now
+
+                if now - last_reconnect >= RECONNECT_INTERVAL_S:
+                    logger.info(
+                        "🔁 Scheduled reconnect of all device workers"
+                    )
                     stop_processes(processes)
-                    processes = reconnect_devices(shared_buffer)
-                    last_reconnect = time.time()
+                    processes.clear()
+                    supervise_processes(processes)
+                    last_reconnect = now
 
-                # End-of-day at ~23:59 once per day
-                if now.hour == 23 and now.minute == 59:
-                    if last_eod_run_date != date.today():
-                        logger.info("🧹 EoD window detected; running EoD task...")
-                        try:
-                            end_of_day_task()
-                        except Exception as e:
-                            logger.error(f"❌ EoD task error: {e}")
-                        last_eod_run_date = date.today()
-                        time.sleep(60)  # avoid multiple runs in the same minute
+                # Daily EoD: anywhere in 23:55-23:59, run once per day,
+                # retry every minute within the window if it fails.
+                if (
+                    now_dt.hour == 23
+                    and 55 <= now_dt.minute <= 59
+                    and last_eod_done_marker != today_iso
+                    and (now - last_eod_attempt >= 60)
+                ):
+                    last_eod_attempt = now
+                    try:
+                        if end_of_day_task(lookback_days=EOD_LOOKBACK_DAYS):
+                            last_eod_done_marker = today_iso
+                            queue.set_state("last_eod_date", today_iso)
+                    except Exception as exc:
+                        logger.exception(f"EoD task error: {exc}")
 
-                # Periodic flush safeguard in main (in case device processes died)
-                if len(shared_buffer) >= BUFFER_LIMIT:
-                    logger.info("📤 Main loop flush due to size")
-                    push_to_server(shared_buffer)
+                stop_event.wait(timeout=1.0)
+            except Exception as exc:
+                logger.exception(f"Main loop iteration error: {exc}")
+                tg_send(
+                    f"❌ <b>Main Loop Error</b>\n"
+                    f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                    f"🔧 {str(exc)[:200]}",
+                    kind="main_loop_err",
+                    min_interval_s=600,
+                )
+                stop_event.wait(timeout=2.0)
+    finally:
+        logger.info("🛑 Stopping...")
+        stop_event.set()
+        try:
+            pusher.join(timeout=10)
+        except Exception:
+            pass
+        stop_processes(processes)
+        try:
+            stats = queue.stats()
+        except Exception:
+            stats = {}
+        logger.info(f"👋 Stopped. Queue stats: {stats}")
+        tg_send(
+            f"👋 <b>System Stopped</b>\n"
+            f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"📦 Pending: {stats.get('pending', '?')}",
+            kind="shutdown",
+        )
 
-                time.sleep(1)
-
-        except KeyboardInterrupt:
-            logger.info("⏹️ Terminated by user")
-            tg_send_with_name(
-                f"⏹️ <b>System Shutdown</b>\n\n"
-                f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"📝 <b>Reason:</b> KeyboardInterrupt"
-            )
-        except Exception as e:
-            logger.error(f"❌ Unexpected error in main loop: {e}")
-            tg_send_with_name(
-                f"❌ <b>System Error</b>\n\n"
-                f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"❌ <b>Error:</b> {str(e)}"
-            )
-        finally:
-            logger.info("🛑 Stopping device processes...")
-            stop_processes(processes)
-
-            # Final flush if anything pending
-            if len(shared_buffer) > 0:
-                logger.info(f"📤 Final flush of {len(shared_buffer)} records...")
-                push_to_server(shared_buffer)
-
-            logger.info("👋 Attendance ZTech stopped")
-            tg_send_with_name(
-                f"👋 <b>System Stopped</b>\n\n"
-                f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"🔌 <b>Status:</b> All processes terminated"
-            )
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("⏹️ Script terminated by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
+        logger.info("⏹️ Interrupted by user")
+    except Exception as exc:
+        logger.exception(f"💥 Fatal error: {exc}")
+        try:
+            tg_send(
+                f"💥 <b>Fatal Error</b>\n"
+                f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                f"🔧 {str(exc)[:300]}",
+                kind="fatal",
+            )
+        except Exception:
+            pass
         sys.exit(1)
