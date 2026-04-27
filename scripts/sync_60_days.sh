@@ -16,8 +16,13 @@
 
 set -u
 
-# --- Edit this if the project lives somewhere else --------------------------
-PROJECT_DIR="${ATTENDANCE_PROJECT_DIR:-/opt/attendance-ztech}"
+# --- Auto-detection ---------------------------------------------------------
+# The script lives inside the project folder under scripts/, so by default we
+# resolve the project as the script's parent directory. This works no matter
+# whether the project is at /opt/attendance-ztech, ~/Projects/attendance-ztech,
+# or anywhere else. Override with ATTENDANCE_PROJECT_DIR if you ever need to.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+PROJECT_DIR="${ATTENDANCE_PROJECT_DIR:-$(dirname "$SCRIPT_DIR")}"
 DAYS="${ATTENDANCE_BACKFILL_DAYS:-60}"
 # ----------------------------------------------------------------------------
 

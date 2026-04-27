@@ -15,7 +15,10 @@
 
 set -euo pipefail
 
-PROJECT_DIR="${ATTENDANCE_PROJECT_DIR:-/opt/attendance-ztech}"
+# Resolve the project folder from the location of this installer script.
+# (scripts/install_desktop_shortcut.sh → project dir is the parent.)
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+PROJECT_DIR="${ATTENDANCE_PROJECT_DIR:-$(dirname "$SCRIPT_DIR")}"
 SRC_DESKTOP="$PROJECT_DIR/scripts/Sync60Days.desktop"
 SRC_SCRIPT="$PROJECT_DIR/scripts/sync_60_days.sh"
 
@@ -31,10 +34,10 @@ fi
 # Make the wrapper executable
 chmod +x "$SRC_SCRIPT"
 
-# Patch the Exec= line so the .desktop file points at the actual project dir
-# (not necessarily /opt/attendance-ztech).
+# Patch the __PROJECT_DIR__ placeholder in the .desktop file with the
+# actual install location (could be /opt/..., ~/Projects/..., anywhere).
 TMP_DESKTOP="$(mktemp)"
-sed "s|/opt/attendance-ztech|$PROJECT_DIR|g" "$SRC_DESKTOP" > "$TMP_DESKTOP"
+sed "s|__PROJECT_DIR__|$PROJECT_DIR|g" "$SRC_DESKTOP" > "$TMP_DESKTOP"
 
 # Resolve the user's Desktop folder using XDG (falls back to ~/Desktop)
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
