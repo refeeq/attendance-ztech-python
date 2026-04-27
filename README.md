@@ -24,7 +24,7 @@ built the way it is, and how to operate it on a school server.
 10. [A Typical Day, hour by hour](#10-a-typical-day-hour-by-hour)
 11. [Telegram alerts](#11-telegram-alerts)
 12. [Logs — where they are, how to read them](#12-logs)
-13. [Health checks an admin can run](#13-health-checks)
+13. [Health checks & querying the archive](#13-health-checks--querying-the-archive)
 14. [Failure scenarios — and how the system recovers automatically](#14-failure-scenarios)
 15. [Common operations](#15-common-operations)
 16. [Troubleshooting cookbook](#16-troubleshooting)
@@ -571,11 +571,13 @@ grep "EoD" logs/attendance.log
 
 ---
 
-## 13. Health checks
+## 13. Health checks & querying the archive
 
-The system exposes its state in two places.
+The system exposes its state in three places: the **logbook file**, the
+**Telegram chat**, and the **logs**. The logbook is also a permanent
+attendance archive you can query any time.
 
-### A) The logbook itself
+### A) Quick health snapshot
 
 ```bash
 sqlite3 data/attendance_queue.db <<SQL
@@ -590,12 +592,211 @@ SELECT id, device_id, user_id, timestamp, sync_attempts, last_error
 SQL
 ```
 
-### B) The Telegram chat
+If `pending` is 0 and the latest log line is recent, the system is healthy.
+
+### B) Telegram chat
 
 If `pending` keeps growing, you'll see periodic `❌ Sync Failed` messages
 that include the current pending count.
 
-If `pending` is 0 and the latest log line is recent, the system is healthy.
+### C) Querying the attendance archive
+
+> Every attendance event the system has ever seen is stored permanently in
+> `data/attendance_queue.db` (a single SQLite file). You can query it any
+> time without touching the ERP.
+
+#### Connecting
+
+You have two ways to open the database — pick whichever you prefer:
+
+```bash
+# Option 1: install the sqlite3 CLI (handy for ad-hoc queries)
+sudo apt install -y sqlite3
+
+# Option 2: use Python (already on the server, nothing to install)
+cd ~/Projects/attendance-ztech-python && source venv/bin/activate
+python -c "import sqlite3; \
+  c = sqlite3.connect('data/attendance_queue.db'); \
+  print(c.execute('SELECT COUNT(*) FROM attendance_queue').fetchone())"
+```
+
+#### The table you'll query
+
+```
+attendance_queue
+├─ id              auto-incrementing row number
+├─ device_id       which biometric device the punch came from
+├─ user_id         the biometric user ID
+├─ timestamp       'YYYY-MM-DD HH:MM:SS' — when the punch happened
+├─ status          ZK verification mode (fingerprint / card / password)
+├─ punch           ZK punch state (in / out / break / overtime)
+├─ synced          0 = not yet sent to ERP; 1 = delivered
+├─ sync_attempts   number of push attempts for this row
+├─ last_attempt_at timestamp of last push attempt
+├─ last_error      error from the last failed push (if any)
+└─ created_at      when the row first landed in the logbook
+```
+
+#### Common questions, ready to copy-paste
+
+Open the database first:
+
+```bash
+sqlite3 data/attendance_queue.db
+```
+
+Then, inside the `sqlite>` prompt, paste any of these:
+
+**Total records and date range.**
+
+```sql
+.mode column
+.headers on
+SELECT COUNT(*) AS total,
+       MIN(timestamp) AS oldest,
+       MAX(timestamp) AS newest
+FROM attendance_queue;
+```
+
+**How many punches per day, last 30 days.**
+
+```sql
+SELECT DATE(timestamp) AS day, COUNT(*) AS punches
+FROM attendance_queue
+GROUP BY day
+ORDER BY day DESC
+LIMIT 30;
+```
+
+**How many punches per device.**
+
+```sql
+SELECT device_id, COUNT(*) AS records
+FROM attendance_queue
+GROUP BY device_id
+ORDER BY device_id;
+```
+
+**Everything for one user (e.g. user 1042) in March 2026.**
+
+```sql
+SELECT device_id, timestamp, status, punch
+FROM attendance_queue
+WHERE user_id = 1042
+  AND timestamp BETWEEN '2026-03-01' AND '2026-03-31 23:59:59'
+ORDER BY timestamp;
+```
+
+**First and last time a user clocked in.**
+
+```sql
+SELECT user_id,
+       MIN(timestamp) AS first_seen,
+       MAX(timestamp) AS last_seen,
+       COUNT(*)       AS total_punches
+FROM attendance_queue
+WHERE user_id = 5512;
+```
+
+**Top 10 most active users this month.**
+
+```sql
+SELECT user_id, COUNT(*) AS punches
+FROM attendance_queue
+WHERE timestamp >= DATE('now', 'start of month')
+GROUP BY user_id
+ORDER BY punches DESC
+LIMIT 10;
+```
+
+**All punches between two specific dates.**
+
+```sql
+SELECT user_id, device_id, timestamp
+FROM attendance_queue
+WHERE timestamp BETWEEN '2026-04-01' AND '2026-04-30 23:59:59'
+ORDER BY timestamp;
+```
+
+**Anything that hasn't been delivered to the ERP yet.**
+
+```sql
+SELECT id, device_id, user_id, timestamp, sync_attempts, last_error
+FROM attendance_queue
+WHERE synced = 0
+ORDER BY id;
+```
+
+**Days where one specific user did NOT punch in this month.** Useful for
+HR / absentee reports.
+
+```sql
+WITH days AS (
+  SELECT DATE('now', 'start of month', '+'||x||' days') AS day
+  FROM (SELECT 0 AS x UNION SELECT 1 UNION SELECT 2 UNION SELECT 3
+        UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7
+        UNION SELECT 8 UNION SELECT 9 UNION SELECT 10 UNION SELECT 11
+        UNION SELECT 12 UNION SELECT 13 UNION SELECT 14 UNION SELECT 15
+        UNION SELECT 16 UNION SELECT 17 UNION SELECT 18 UNION SELECT 19
+        UNION SELECT 20 UNION SELECT 21 UNION SELECT 22 UNION SELECT 23
+        UNION SELECT 24 UNION SELECT 25 UNION SELECT 26 UNION SELECT 27
+        UNION SELECT 28 UNION SELECT 29 UNION SELECT 30)
+  WHERE day <= DATE('now')
+)
+SELECT day FROM days
+WHERE day NOT IN (
+  SELECT DATE(timestamp) FROM attendance_queue
+   WHERE user_id = 1042
+)
+ORDER BY day;
+```
+
+#### Exporting to CSV (e.g. to share with HR)
+
+Inside the `sqlite>` prompt:
+
+```sql
+.headers on
+.mode csv
+.output april_2026.csv
+
+SELECT user_id, device_id, timestamp, status, punch
+FROM attendance_queue
+WHERE timestamp BETWEEN '2026-04-01' AND '2026-04-30 23:59:59'
+ORDER BY user_id, timestamp;
+
+.output stdout
+.quit
+```
+
+That writes `april_2026.csv` to the current folder, which you can email,
+upload to Google Sheets, or open in Excel.
+
+#### Quick one-liners (no sqlite3 prompt needed)
+
+```bash
+# Today's total punch count
+sqlite3 data/attendance_queue.db \
+  "SELECT COUNT(*) FROM attendance_queue WHERE DATE(timestamp)=DATE('now');"
+
+# Last 5 punches across all devices
+sqlite3 -header -column data/attendance_queue.db \
+  "SELECT device_id, user_id, timestamp FROM attendance_queue \
+   ORDER BY id DESC LIMIT 5;"
+
+# Database size
+du -h data/attendance_queue.db
+```
+
+#### Safety note
+
+> **Never** `DELETE` rows where `synced = 0` — those have not been delivered
+> to the ERP yet. Deleting them means losing those records permanently.
+>
+> Reading is always safe. Writing or deleting from this database while the
+> daemon is running can cause "database is locked" errors temporarily; if
+> you must do an UPDATE/DELETE, briefly stop the daemon (`pm2 stop
+> attendance-sync`), do your edit, then start it again.
 
 ---
 
@@ -824,3 +1025,32 @@ A: Two places:
 
 *Built for Pace Education · 9 schools, 9 servers, one philosophy: never lose
 a punch, never bother a human.*
+
+### quaries
+
+-- All punches by user 1042 in March 2026
+SELECT device_id, timestamp, status, punch
+FROM attendance_queue
+WHERE user_id = 1042
+  AND timestamp BETWEEN '2026-03-01' AND '2026-03-31 23:59:59'
+ORDER BY timestamp;
+
+-- Daily punch count for the whole school
+SELECT DATE(timestamp) AS day, COUNT(*) AS punches
+FROM attendance_queue
+GROUP BY day
+ORDER BY day DESC
+LIMIT 30;
+
+-- Has user 5512 ever clocked in?
+SELECT MIN(timestamp), MAX(timestamp), COUNT(*)
+FROM attendance_queue
+WHERE user_id = 5512;
+
+-- Export everything from a date range to CSV
+.headers on
+.mode csv
+.output march_2026.csv
+SELECT * FROM attendance_queue
+WHERE timestamp BETWEEN '2026-03-01' AND '2026-03-31 23:59:59';
+.quit
