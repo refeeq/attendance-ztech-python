@@ -557,7 +557,7 @@ never fill up on their own:
 Each line looks like:
 
 ```
-2026-04-26 08:32:11 - INFO - 🕘 [dev 1] punch user=1042 @ 2026-04-26 08:32:11
+2026-04-26 08:32:11 - INFO - 🕘 [device 1] punch user=1042 @ 2026-04-26 08:32:11
 2026-04-26 08:32:25 - INFO - ✅ Synced 14 records (pending after: 0)
 ```
 
@@ -984,7 +984,7 @@ A: Two places:
                        │           │           │
                 ┌──────┴──┐ ┌──────┴──┐ ┌──────┴──┐
                 │ Capture │ │ Capture │ │ Capture │
-                │  dev 1  │ │  dev 2  │ │  dev N  │
+                │ device 1│ │ device 2│ │ device N│
                 └─────────┘ └─────────┘ └─────────┘
                      ▲           ▲           ▲
                      │           │           │

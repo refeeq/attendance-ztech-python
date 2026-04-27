@@ -503,7 +503,9 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
     while True:
         conn = None
         try:
-            sub_logger.info(f"🔌 [dev {device_id}] Connecting to {ip}:{port}")
+            sub_logger.info(
+                f"🔌 [device {device_id}] Connecting to {ip}:{port}"
+            )
             zk = ZK(
                 ip,
                 port=port,
@@ -517,7 +519,7 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
                 raise RuntimeError("connect() returned None")
             conn.enable_device()
             sub_logger.info(
-                f"✅ [dev {device_id}] Connected, entering live capture"
+                f"✅ [device {device_id}] Connected, entering live capture"
             )
             backoff = 5
 
@@ -527,22 +529,22 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
                 record = _record_from_zk(attendance, device_id)
                 if record is None:
                     sub_logger.warning(
-                        f"⚠️ [dev {device_id}] skip malformed attendance"
+                        f"⚠️ [device {device_id}] skip malformed attendance"
                     )
                     continue
                 try:
                     if local_queue.enqueue_one(record):
                         sub_logger.info(
-                            f"🕘 [dev {device_id}] punch user="
+                            f"🕘 [device {device_id}] punch user="
                             f"{record['user_id']} @ {record['timestamp']}"
                         )
                 except Exception as exc:
                     sub_logger.error(
-                        f"❌ [dev {device_id}] enqueue failed: {exc}"
+                        f"❌ [device {device_id}] enqueue failed: {exc}"
                     )
         except Exception as exc:
             sub_logger.error(
-                f"❌ [dev {device_id}] capture error: {exc}; "
+                f"❌ [device {device_id}] capture error: {exc}; "
                 f"reconnecting in {backoff}s"
             )
             time.sleep(backoff)
@@ -565,7 +567,7 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
     port = int(device.get("port", 4370) or 4370)
     pwd = _safe_password(device)
 
-    logger.info(f"🧹 [dev {device_id}] EoD pull from {ip}:{port}")
+    logger.info(f"🧹 [device {device_id}] EoD pull from {ip}:{port}")
     zk = ZK(
         ip,
         port=port,
@@ -587,7 +589,7 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
             pass
 
     if not logs:
-        logger.info(f"ℹ️ [dev {device_id}] No logs found")
+        logger.info(f"ℹ️ [device {device_id}] No logs found")
         return 0
 
     records: List[Dict[str, Any]] = []
@@ -604,7 +606,7 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
 
     new_count = queue.enqueue_many(records)
     logger.info(
-        f"🧹 [dev {device_id}] EoD scanned={len(logs)} "
+        f"🧹 [device {device_id}] EoD scanned={len(logs)} "
         f"matched={len(records)} new={new_count}"
     )
     return new_count
