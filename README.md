@@ -185,8 +185,11 @@ Let's follow a single punch, end to end.
      out → **nothing is marked synced**, the rows stay in the logbook, and
      the pusher will retry on the next cycle with exponential backoff. A
      Telegram alert is sent (rate-limited so the chat is not spammed).
-6. **The logbook self-cleans.** Once a row has been synced for more than 14
-   days (configurable), it is purged so the database stays small.
+6. **The logbook keeps the record forever.** Every synced row stays in the
+   database permanently, so you have a full historical archive of every
+   attendance event the system has ever seen. (You can opt into automatic
+   purging via `purge_synced_after_days` in `config.json` if you ever want
+   to, but the default keeps everything.)
 
 That is the entire happy path. Now look at every step where something can go
 wrong — and notice that none of them lose the punch:
@@ -365,7 +368,7 @@ durable queue without touching code:
     "push_interval_s": 15,
     "push_timeout_s": 60,
     "push_retries": 5,
-    "purge_synced_after_days": 14,
+    "purge_synced_after_days": 0,
     "watchdog_interval_s": 30,
     "reconnect_interval_min": 15,
     "eod_lookback_days": 1,
@@ -382,7 +385,7 @@ durable queue without touching code:
 | `push_interval_s` | How often the pusher polls the logbook. |
 | `push_timeout_s` | HTTP timeout per push. |
 | `push_retries` | How many times each push is retried before backing off. |
-| `purge_synced_after_days` | Synced rows are deleted after this many days. |
+| `purge_synced_after_days` | `0` = **keep records forever** (default). Set to a positive number (e.g. `90`) only if you want synced rows automatically deleted after that many days to save disk. |
 | `watchdog_interval_s` | How often the watchdog checks capture workers. |
 | `reconnect_interval_min` | Periodic full reconnect cycle. |
 | `eod_lookback_days` | Daily 23:55 catch-up scans this many recent days. |
@@ -681,12 +684,27 @@ sudo journalctl -u attendance-ztech --no-pager | tail -50
 
 ### The logbook is huge
 
-The pusher purges synced records older than 14 days every hour
-automatically. If you ever want to truncate by hand:
+By default, **every record is kept forever** — you have a permanent
+attendance archive on the server. Each row is ~300 bytes, so even
+100,000 records/year only adds ~30 MB/year. Most schools never need to
+worry about this.
+
+If you ever do want to free space, you have two options:
+
+**Option A — turn on automatic purge** (e.g. keep last 365 days):
+
+```json
+"sync": { "purge_synced_after_days": 365 }
+```
+
+Restart the service. Synced rows older than 365 days are then deleted
+automatically once an hour.
+
+**Option B — one-off manual cleanup**:
 
 ```bash
 sqlite3 data/attendance_queue.db \
-  "DELETE FROM attendance_queue WHERE synced = 1;"
+  "DELETE FROM attendance_queue WHERE synced = 1 AND created_at < '2025-01-01';"
 sqlite3 data/attendance_queue.db "VACUUM;"
 ```
 

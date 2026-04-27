@@ -249,8 +249,16 @@ class AttendanceQueue:
                 raise
 
     # ----------------------------------------------------------------- maintain
-    def purge_synced_older_than(self, days: int = 14) -> int:
-        days = max(1, int(days))
+    def purge_synced_older_than(self, days: int = 0) -> int:
+        """Delete synced records older than ``days`` days.
+
+        Pass ``days <= 0`` to **disable** purging entirely. The durable queue
+        is then a permanent historical record of every attendance event the
+        system has ever seen, which is the project's default behaviour.
+        """
+        days = int(days)
+        if days <= 0:
+            return 0
         cutoff = (datetime.utcnow() - timedelta(days=days)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )

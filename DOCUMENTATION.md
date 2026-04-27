@@ -893,7 +893,7 @@ All optional. Defaults shown. Existing configs work unchanged.
     "push_interval_s": 15,
     "push_timeout_s": 60,
     "push_retries": 5,
-    "purge_synced_after_days": 14,
+    "purge_synced_after_days": 0,
     "watchdog_interval_s": 30,
     "reconnect_interval_min": 15,
     "eod_lookback_days": 1,
@@ -910,7 +910,7 @@ All optional. Defaults shown. Existing configs work unchanged.
 | `push_interval_s` | How often the pusher polls the queue. |
 | `push_timeout_s` | HTTP timeout per push. |
 | `push_retries` | Retries per push attempt before backing off. |
-| `purge_synced_after_days` | Synced rows are deleted after this many days to keep the DB small. |
+| `purge_synced_after_days` | `0` (default) keeps every synced row forever — the durable queue becomes a permanent attendance archive. Set to a positive integer (e.g. `365`) only if you want synced rows automatically deleted after that many days. |
 | `watchdog_interval_s` | Cadence of the device-process health check. |
 | `reconnect_interval_min` | Periodic full reconnect cycle (safety net). |
 | `eod_lookback_days` | Daily EoD pulls today + this many prior days (idempotent). |

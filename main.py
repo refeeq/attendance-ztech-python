@@ -147,7 +147,7 @@ PUSH_BATCH_SIZE      = max(1,  int(_SYNC_CFG.get("batch_size", 200)))
 PUSH_INTERVAL_S      = max(1,  int(_SYNC_CFG.get("push_interval_s", 15)))
 PUSH_TIMEOUT_S       = max(5,  int(_SYNC_CFG.get("push_timeout_s", 60)))
 PUSH_RETRIES         = max(1,  int(_SYNC_CFG.get("push_retries", 5)))
-PURGE_DAYS           = max(1,  int(_SYNC_CFG.get("purge_synced_after_days", 14)))
+PURGE_DAYS           = int(_SYNC_CFG.get("purge_synced_after_days", 0))
 WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
 RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
@@ -170,10 +170,14 @@ telegram_notifier = TelegramNotifier(
     system_name=SYSTEM_NAME,
 )
 
+_retention = (
+    "forever" if PURGE_DAYS <= 0 else f"{PURGE_DAYS}d after sync"
+)
 logger.info(
     f"Config: devices={len(DEVICES)} endpoint={ENDPOINT} "
     f"batch_size={PUSH_BATCH_SIZE} push_interval_s={PUSH_INTERVAL_S} "
     f"reconnect_interval_s={RECONNECT_INTERVAL_S} db={DB_PATH} "
+    f"retention={_retention} "
     f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
 )
 
@@ -367,7 +371,7 @@ def pusher_loop(stop_event: threading.Event) -> None:
                 continue
 
             if pending == 0:
-                if now - last_purge >= 3600:
+                if PURGE_DAYS > 0 and now - last_purge >= 3600:
                     try:
                         deleted = queue.purge_synced_older_than(PURGE_DAYS)
                         if deleted:
