@@ -1,12 +1,22 @@
+
 {
-  "endpoint": "https://pmbs.paceeducation.com/erp-api/sync/empAttSync.php",
-  "name": "PMBS-attendance",
+  "endpoint": "https://pace.paceeducation.com/erp-api/sync/empAttSync.php",
+  "name" : "PACE_ATTENDANCE",
   "devices": [
     {
       "device_id": 1,
-      "ip_address": "10.50.141.32",
-      "port": 4370,
-      "password": "4546"
+      "ip_address": "10.30.141.3",
+      "port": 4370
+    },
+    {
+      "device_id": 2,
+      "ip_address": "10.30.141.4",
+      "port": 4370
+    },
+    {
+      "device_id": 3,
+      "ip_address": "10.30.141.5",
+      "port": 4370
     }
   ],
   "buffer_limit": 3,

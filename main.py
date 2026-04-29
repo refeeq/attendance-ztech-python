@@ -442,12 +442,10 @@ def pusher_loop(stop_event: threading.Event) -> None:
                         min_interval_s=60,
                     )
                 consecutive_failures = 0
-                tg_send(
-                    f"✅ <b>Sync OK</b>\n"
-                    f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-                    f"🧾 Records: {len(ids)}",
-                    kind="push_success",
-                    min_interval_s=600,
+                # One Telegram per successful ERP push (no throttle — matches
+                # per-punch / per-batch visibility on other school servers).
+                telegram_notifier.send_data_push_notification_sync(
+                    len(ids), True, records=records
                 )
             else:
                 try:
@@ -459,14 +457,21 @@ def pusher_loop(stop_event: threading.Event) -> None:
                     f"❌ Sync failed (attempt #{consecutive_failures}, "
                     f"pending={pending}): {err}"
                 )
-                tg_send(
-                    f"❌ <b>Sync Failed</b>\n"
-                    f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-                    f"📦 Pending: {pending}\n"
-                    f"🔧 {str(err)[:200]}",
-                    kind="push_failure",
-                    min_interval_s=300,
-                )
+                if telegram_notifier.enabled and (
+                    telegram_notifier.is_notification_enabled("data_push")
+                    or telegram_notifier.is_notification_enabled("errors")
+                ):
+                    fail_msg = telegram_notifier.data_push_message_html(
+                        len(ids),
+                        False,
+                        records=records,
+                        error=str(err)[:500],
+                    )
+                    tg_send(
+                        fail_msg,
+                        kind="push_failure",
+                        min_interval_s=300,
+                    )
                 # Cool-off so we don't hammer a broken endpoint.
                 cool_off = min(60, 5 + 5 * min(consecutive_failures, 6))
                 stop_event.wait(timeout=cool_off)
