@@ -74,7 +74,9 @@ def load_config() -> dict:
 
 
 def setup_logging(level_name: Optional[str], cfg: dict) -> None:
-    level_str = level_name or cfg.get("log_level", "INFO")
+    # Keep sync_all chatty by default for desktop/manual runs. If the operator
+    # passes --log-level, honor it.
+    level_str = level_name or "INFO"
     logging.basicConfig(
         level=getattr(logging, str(level_str).upper(), logging.INFO),
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -277,7 +279,10 @@ def main() -> int:
     total_enqueued = 0
     total_pushed = 0
 
-    for device in devices:
+    for idx, device in enumerate(devices, start=1):
+        logging.info(
+            f"[{device.get('device_id')}] Starting device {idx}/{len(devices)}"
+        )
         try:
             raw_logs = collect_device_logs(device)
         except Exception as exc:
@@ -328,6 +333,14 @@ def main() -> int:
                 f"[{device.get('device_id')}] Enqueued {new} new records "
                 f"(of {len(logs)})."
             )
+            try:
+                pending_now = queue.count_unsynced()
+                logging.info(
+                    f"[{device.get('device_id')}] Queue pending now: "
+                    f"{pending_now}"
+                )
+            except Exception:
+                pass
         except Exception as exc:
             logging.error(
                 f"[{device.get('device_id')}] enqueue failed: {exc}"

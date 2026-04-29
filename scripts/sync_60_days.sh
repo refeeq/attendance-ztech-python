@@ -31,6 +31,17 @@ GREEN=$'\e[32m'
 YELLOW=$'\e[33m'
 BOLD=$'\e[1m'
 RESET=$'\e[0m'
+PM2_TAIL_PID=""
+
+cleanup_background_jobs() {
+    if [[ -n "${PM2_TAIL_PID:-}" ]]; then
+        kill "$PM2_TAIL_PID" >/dev/null 2>&1 || true
+        wait "$PM2_TAIL_PID" >/dev/null 2>&1 || true
+        PM2_TAIL_PID=""
+    fi
+}
+
+trap cleanup_background_jobs EXIT INT TERM
 
 pause_and_exit() {
     local code="${1:-0}"
@@ -102,6 +113,20 @@ esac
 echo
 echo "${BOLD}Starting sync...${RESET}"
 echo "(This can take a few minutes depending on how many devices you have.)"
+echo "Progress will be shown below (device-by-device + heartbeat every 10s)."
+
+if command -v pm2 >/dev/null 2>&1 && pm2 describe attendance-ztech >/dev/null 2>&1; then
+    echo "Attaching live daemon push logs (attendance-ztech) ..."
+    pm2 logs attendance-ztech --lines 0 2>/dev/null &
+    PM2_TAIL_PID=$!
+    sleep 1
+    if ! kill -0 "$PM2_TAIL_PID" >/dev/null 2>&1; then
+        PM2_TAIL_PID=""
+        echo "(Could not attach PM2 logs; continuing with sync logs only.)"
+    fi
+else
+    echo "(PM2 not found or attendance-ztech not running; showing sync logs only.)"
+fi
 echo
 
 START_TS=$(date +%s)
@@ -109,7 +134,18 @@ START_TS=$(date +%s)
 # --no-push  → only write into the local logbook; let the running PM2 daemon
 #              drain it to the ERP. This avoids racing with the daemon and
 #              guarantees no duplicate POSTs.
-"$PYTHON" "$PROJECT_DIR/sync_all.py" --no-push --from "$FROM_DATE" --to "$TODAY"
+PYTHONUNBUFFERED=1 "$PYTHON" "$PROJECT_DIR/sync_all.py" --no-push --from "$FROM_DATE" --to "$TODAY" &
+SYNC_PID=$!
+
+# Heartbeat so admins never stare at a blank terminal during long device pulls.
+while kill -0 "$SYNC_PID" >/dev/null 2>&1; do
+    NOW_TS=$(date +%s)
+    RUN_FOR=$(( NOW_TS - START_TS ))
+    printf '[%s] Still syncing... elapsed=%ss\n' "$(date '+%H:%M:%S')" "$RUN_FOR"
+    sleep 10
+done
+
+wait "$SYNC_PID"
 RC=$?
 
 END_TS=$(date +%s)
