@@ -146,10 +146,7 @@ class TelegramNotifier:
         if records:
             block = _format_punch_details_lines(records)
             if block:
-                details_block = (
-                    f"\n\n👤 <b>Punches</b> "
-                    f"<i>(User = ZKTeco id, same field sent to ERP)</i>\n{block}"
-                )
+                details_block = f"\n\n👤 <b>Punches</b>\n{block}"
 
         err_block = ""
         if error:
