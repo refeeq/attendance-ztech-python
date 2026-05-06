@@ -162,8 +162,12 @@ def push_batch(
     return False
 
 
-def collect_device_logs(device: dict) -> List[dict]:
-    """Fetch ALL logs from a device and return as a list of dicts."""
+def collect_device_logs(device: dict) -> Optional[List[dict]]:
+    """Fetch ALL logs from a device.
+
+    Returns ``None`` if the device could not be read (connection errors, etc.).
+    Returns ``[]`` if the read succeeded but the device had no attendance rows.
+    """
     zk = ZK(
         device["ip_address"],
         port=int(device.get("port", 4370) or 4370),
@@ -182,7 +186,7 @@ def collect_device_logs(device: dict) -> List[dict]:
             logging.error(
                 f"[{device['device_id']}] connect() returned None"
             )
-            return []
+            return None
         conn.enable_device()
         logs = conn.get_attendance() or []
         logging.info(
@@ -211,7 +215,7 @@ def collect_device_logs(device: dict) -> List[dict]:
         logging.error(
             f"[{device['device_id']}] Error collecting logs: {exc}"
         )
-        return []
+        return None
     finally:
         if conn is not None:
             try:
@@ -289,6 +293,10 @@ def main() -> int:
             logging.error(
                 f"[{device.get('device_id')}] collect failed: {exc}"
             )
+            overall_ok = False
+            continue
+
+        if raw_logs is None:
             overall_ok = False
             continue
 
