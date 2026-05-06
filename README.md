@@ -131,7 +131,7 @@ Each file has one job. You don't need to read the code to use the system.
 
 | File | Plain-English role |
 |---|---|
-| `main.py` | **The driver.** The always-on program that connects to the devices, listens for punches, runs the truck, and orchestrates everything. This is the service that systemd / Docker keeps alive 24×7. |
+| `main.py` | **The driver.** The always-on program that connects to the devices, listens for punches, runs the truck, and orchestrates everything. This is the service that PM2 / systemd / Docker keeps alive 24×7. |
 | `storage.py` | **The logbook.** A tiny library that owns the local database file. Every punch goes through it. It promises: "if I told you I saved a record, it is permanently saved, even if the machine loses power right now." |
 | `sync_all.py` | **The fetch tool.** A command you can run once to ask each device "give me your last N days of punches" and feed them into the logbook. Useful for backfills and one-off reconciliations. |
 | `boot_sync_30d.py` | **The boot recovery tool.** Runs automatically when the machine starts up. Calls `sync_all.py` for the last 60 days so any punches from while the machine was off are not lost. |
@@ -396,16 +396,15 @@ durable queue without touching code:
 
 ## 9. Installing on a school server
 
-You can install in **three** ways. Pick the one that matches your school's
-setup. (Linux/systemd is the recommended option for the 9 production
-servers.)
+You can install in **four** ways. Pick the one that matches your school's
+setup. (Linux + PM2 is the recommended option for school servers.)
 
-### Option A — Linux server with systemd (recommended)
+### Option A — Linux server with PM2 (recommended)
 
 ```bash
 # 1. Get the code
-git clone <your-repo-url> /opt/attendance-ztech
-cd /opt/attendance-ztech
+git clone <your-repo-url> /Projects/attendance-ztech-python
+cd /Projects/attendance-ztech-python
 
 # 2. Create a Python virtual environment and install requirements
 python3 -m venv venv
@@ -413,6 +412,58 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # 3. Edit the school-specific settings
+nano config.json
+
+# 4. Test once in the foreground
+python main.py
+# (Ctrl+C to stop)
+
+# 5. Install PM2 (once per server)
+sudo apt update
+sudo apt install -y nodejs npm
+sudo npm install -g pm2
+
+# 6. Start the daemon with PM2
+cd /Projects/attendance-ztech-python
+pm2 start /Projects/attendance-ztech-python/venv/bin/python --name attendance-ztech -- /Projects/attendance-ztech-python/main.py
+
+# 7. Make PM2 auto-start on reboot (run the printed sudo command)
+pm2 startup
+
+# 8. Save the current PM2 process list
+pm2 save
+```
+
+Daily PM2 operations:
+
+```bash
+pm2 list
+pm2 logs attendance-ztech --lines 100
+pm2 restart attendance-ztech
+pm2 stop attendance-ztech
+pm2 delete attendance-ztech
+```
+
+To also enable the desktop icon + manual 60-day backfill launcher:
+
+```bash
+cd /Projects/attendance-ztech-python
+bash scripts/install_desktop_shortcut.sh
+```
+
+### Option B — Linux server with systemd (alternative)
+
+```bash
+# 1. Get the code
+git clone <your-repo-url> /Projects/attendance-ztech-python
+cd /Projects/attendance-ztech-python
+
+# 2. Create a Python virtual environment and install requirements
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Edit school-specific settings
 nano config.json
 
 # 4. Test once in the foreground
@@ -434,8 +485,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/attendance-ztech
-ExecStart=/opt/attendance-ztech/venv/bin/python /opt/attendance-ztech/main.py
+WorkingDirectory=/Projects/attendance-ztech-python
+ExecStart=/Projects/attendance-ztech-python/venv/bin/python /Projects/attendance-ztech-python/main.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -455,7 +506,7 @@ sudo systemctl enable --now attendance-ztech
 To also enable the boot-time historical sync, add the second unit described
 in [`DOCUMENTATION.md` §5](DOCUMENTATION.md).
 
-### Option B — Docker
+### Option C — Docker
 
 ```bash
 docker build -t attendance-ztech .
@@ -471,7 +522,7 @@ docker run -d --name attendance-ztech --restart=always --network=host \
 > The two volume mounts make the durable logbook (`data/`) and the rotating
 > logs (`logs/`) survive container rebuilds.
 
-### Option C — Windows service
+### Option D — Windows service
 
 Follow the steps in `DOCUMENTATION.md` if you must run on Windows. Linux is
 strongly preferred for production.
@@ -827,7 +878,7 @@ sudo journalctl -u attendance-ztech -f
 sudo systemctl restart attendance-ztech
 
 # Sync a specific historical range manually
-cd /opt/attendance-ztech && source venv/bin/activate
+cd /Projects/attendance-ztech-python && source venv/bin/activate
 python sync_all.py --from 2026-04-01 --to 2026-04-26
 
 # Sync only one device

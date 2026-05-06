@@ -80,6 +80,22 @@ if [[ -z "$PYTHON" ]]; then
     pause_and_exit 1
 fi
 
+# sync_all.py needs third-party packages (httpx, pyzk, …). Prefer venv;
+# without it, system python3 often raises ModuleNotFoundError.
+if ! "$PYTHON" -c "import httpx" 2>/dev/null; then
+    echo "${RED}ERROR:${RESET} Python dependencies are missing for:"
+    echo "  $PYTHON"
+    echo
+    echo "Create the project venv and install requirements, then run again"
+    echo "(this script uses venv/bin/python automatically when present):"
+    echo
+    echo "  cd \"$PROJECT_DIR\""
+    echo "  python3 -m venv venv"
+    echo "  ./venv/bin/pip install -r requirements.txt"
+    echo
+    pause_and_exit 1
+fi
+
 if [[ ! -f "$PROJECT_DIR/sync_all.py" ]]; then
     echo "${RED}ERROR:${RESET} sync_all.py not found in $PROJECT_DIR"
     pause_and_exit 1
