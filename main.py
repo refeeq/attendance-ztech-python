@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from zk import ZK
 
-from storage import DEFAULT_DB_PATH, AttendanceQueue
+from storage import DEFAULT_DB_PATH, AttendanceQueue, verify_sqlite_queue_db
 from telegram_notifier import TelegramNotifier
 
 
@@ -98,6 +98,10 @@ def setup_logging() -> logging.Logger:
     ch = logging.StreamHandler()
     ch.setFormatter(formatter)
     log.addHandler(ch)
+
+    # httpx logs every request at INFO (including URLs with secrets).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     return log
 
 
@@ -148,6 +152,9 @@ PUSH_INTERVAL_S      = max(1,  int(_SYNC_CFG.get("push_interval_s", 15)))
 PUSH_TIMEOUT_S       = max(5,  int(_SYNC_CFG.get("push_timeout_s", 60)))
 PUSH_RETRIES         = max(1,  int(_SYNC_CFG.get("push_retries", 5)))
 PURGE_DAYS           = int(_SYNC_CFG.get("purge_synced_after_days", 0))
+# Telegram "data push OK" during backlog drain: at most one message per interval
+# so large queue drain does not hit Telegram 429.
+TG_DATA_PUSH_PROGRESS_INTERVAL_S = 300
 WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
 RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
@@ -273,6 +280,28 @@ def any_device_ping_ok(hosts: List[str], max_wait_s: int = 60) -> bool:
 # ---------------------------------------------------------------------------
 # Queue (parent-side instance)
 # ---------------------------------------------------------------------------
+
+_sql_ok, _sql_msg = verify_sqlite_queue_db(DB_PATH)
+if not _sql_ok:
+    _fix = (
+        f"SQLite queue unusable: {_sql_msg}. File: {DB_PATH}. "
+        "Stop PM2, backup then remove the .db and -wal/-shm siblings, "
+        "restart to recreate an empty queue, then run sync_all or the "
+        "60-day sync script to backfill from devices."
+    )
+    logger.critical(_fix)
+    try:
+        tg_send(
+            f"🔴 <b>Queue database corrupt</b>\n"
+            f"<code>{_sql_msg[:400]}</code>\n"
+            f"Path: <code>{DB_PATH}</code>\n"
+            "Daemon refusing to start.",
+            kind="sqlite_corrupt",
+            min_interval_s=0,
+        )
+    except Exception:
+        pass
+    sys.exit(1)
 
 queue = AttendanceQueue(DB_PATH)
 
@@ -442,11 +471,23 @@ def pusher_loop(stop_event: threading.Event) -> None:
                         min_interval_s=60,
                     )
                 consecutive_failures = 0
-                # One Telegram per successful ERP push (no throttle — matches
-                # per-punch / per-batch visibility on other school servers).
-                telegram_notifier.send_data_push_notification_sync(
-                    len(ids), True, records=records
-                )
+                if telegram_notifier.is_notification_enabled("data_push"):
+                    push_msg = telegram_notifier.data_push_message_html(
+                        len(ids), True, records=records
+                    )
+                    pending_after = max(0, pending - len(ids))
+                    if pending_after == 0:
+                        tg_send(
+                            push_msg,
+                            kind="data_push_complete",
+                            min_interval_s=0,
+                        )
+                    else:
+                        tg_send(
+                            push_msg,
+                            kind="data_push_progress",
+                            min_interval_s=TG_DATA_PUSH_PROGRESS_INTERVAL_S,
+                        )
             else:
                 try:
                     queue.mark_attempt_failed(ids, str(err))

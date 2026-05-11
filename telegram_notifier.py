@@ -3,6 +3,7 @@ import functools
 import html
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -80,9 +81,33 @@ class TelegramNotifier:
             "parse_mode": parse_mode,
         }
 
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(url, json=payload)
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    response = client.post(url, json=payload)
+            except Exception as e:
+                self.logger.error(f"Error sending Telegram message: {e}")
+                return False
+
+            if response.status_code == 429 and attempt + 1 < max_attempts:
+                retry_after = 30
+                try:
+                    data = response.json()
+                    ra = (data.get("parameters") or {}).get("retry_after")
+                    if ra is not None:
+                        retry_after = min(max(int(ra), 1), 120)
+                except (TypeError, ValueError):
+                    pass
+                self.logger.warning(
+                    "Telegram rate limit (429), waiting %ss (attempt %s/%s)",
+                    retry_after,
+                    attempt + 1,
+                    max_attempts - 1,
+                )
+                time.sleep(retry_after)
+                continue
+
             try:
                 response_data = response.json()
             except ValueError:
@@ -111,9 +136,7 @@ class TelegramNotifier:
             )
             return False
 
-        except Exception as e:
-            self.logger.error(f"Error sending Telegram message: {e}")
-            return False
+        return False
 
     async def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
         """

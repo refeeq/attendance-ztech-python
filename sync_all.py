@@ -31,7 +31,7 @@ from typing import Iterable, List, Optional
 import httpx
 from zk import ZK
 
-from storage import DEFAULT_DB_PATH, AttendanceQueue
+from storage import DEFAULT_DB_PATH, AttendanceQueue, verify_sqlite_queue_db
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,8 @@ def setup_logging(level_name: Optional[str], cfg: dict) -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def parse_date(d: Optional[str]) -> Optional[datetime]:
@@ -276,7 +278,19 @@ def main() -> int:
     end_dt = parse_date(args.to_date)
 
     sync_cfg = config.get("sync") or {}
-    queue = AttendanceQueue(sync_cfg.get("db_path", DEFAULT_DB_PATH))
+    db_path = str(sync_cfg.get("db_path", DEFAULT_DB_PATH))
+    ok_sql, sql_msg = verify_sqlite_queue_db(db_path)
+    if not ok_sql:
+        logging.critical(
+            "SQLite queue database is corrupt or unreadable (%s). Path: %s. "
+            "Stop the PM2 daemon, backup then remove this file and its "
+            "-wal/-shm companions, restart once to recreate an empty queue, "
+            "then run this script again.",
+            sql_msg,
+            db_path,
+        )
+        return 2
+    queue = AttendanceQueue(db_path)
 
     overall_ok = True
     total_collected = 0

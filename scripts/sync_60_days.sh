@@ -10,8 +10,9 @@
 #   5. The PM2 daemon then pushes them to the ERP, idempotently
 #   6. Pauses at the end so the admin can read the result.
 #
-# Safe to run at any time, including while the PM2 service is running.
 # Safe to run multiple times — duplicates are silently ignored.
+# If the SQLite queue file is corrupt, this script exits before syncing
+# (fix the queue first; see README / operator runbook).
 # ----------------------------------------------------------------------------
 
 set -u
@@ -106,6 +107,35 @@ if [[ ! -f "$PROJECT_DIR/config.json" ]]; then
     pause_and_exit 1
 fi
 
+echo "Checking SQLite queue database..."
+if ! PROJECT_DIR="$PROJECT_DIR" "$PYTHON" -c '
+import json, os, sys
+sys.path.insert(0, os.environ["PROJECT_DIR"])
+os.chdir(os.environ["PROJECT_DIR"])
+from storage import DEFAULT_DB_PATH, verify_sqlite_queue_db
+with open("config.json") as f:
+    cfg = json.load(f)
+db = str((cfg.get("sync") or {}).get("db_path", DEFAULT_DB_PATH))
+if not os.path.isabs(db):
+    db = os.path.join(os.environ["PROJECT_DIR"], db)
+ok, msg = verify_sqlite_queue_db(db)
+if not ok:
+    print()
+    print("FATAL: local attendance queue database is damaged:")
+    print(" ", msg)
+    print()
+    print("Fix:")
+    print("  1) pm2 stop attendance-sync   (or: pm2 stop all)")
+    print("  2) Backup then remove the queue files, for example:")
+    print("     ", db)
+    print("     ", db + "-wal", "and", db + "-shm", "(if they exist)")
+    print("  3) pm2 start …  then run this 60-day sync again.")
+    print()
+    sys.exit(1)
+'; then
+    pause_and_exit 1
+fi
+
 # Compute date range (portable across GNU and BSD date)
 TODAY="$(date +%F)"
 if date -v-1d +%F >/dev/null 2>&1; then
@@ -131,9 +161,19 @@ echo "${BOLD}Starting sync...${RESET}"
 echo "(This can take a few minutes depending on how many devices you have.)"
 echo "Progress will be shown below (device-by-device + heartbeat every 10s)."
 
-if command -v pm2 >/dev/null 2>&1 && pm2 describe attendance-ztech >/dev/null 2>&1; then
-    echo "Attaching live daemon push logs (attendance-ztech) ..."
-    pm2 logs attendance-ztech --lines 0 2>/dev/null &
+PM2_APP="${ATTENDANCE_PM2_APP:-}"
+if [[ -z "$PM2_APP" ]] && command -v pm2 >/dev/null 2>&1; then
+    for name in attendance-sync attendance-ztech; do
+        if pm2 describe "$name" >/dev/null 2>&1; then
+            PM2_APP="$name"
+            break
+        fi
+    done
+fi
+
+if [[ -n "$PM2_APP" ]]; then
+    echo "Attaching live daemon push logs ($PM2_APP) ..."
+    pm2 logs "$PM2_APP" --lines 0 2>/dev/null &
     PM2_TAIL_PID=$!
     sleep 1
     if ! kill -0 "$PM2_TAIL_PID" >/dev/null 2>&1; then
@@ -141,7 +181,7 @@ if command -v pm2 >/dev/null 2>&1 && pm2 describe attendance-ztech >/dev/null 2>
         echo "(Could not attach PM2 logs; continuing with sync logs only.)"
     fi
 else
-    echo "(PM2 not found or attendance-ztech not running; showing sync logs only.)"
+    echo "(PM2 not found or no known app running; set ATTENDANCE_PM2_APP if needed.)"
 fi
 echo
 
@@ -194,9 +234,6 @@ except Exception as e:
     print(f"  (could not read logbook: {e})")
 PY
 
-PROJECT_DIR="$PROJECT_DIR" "$PYTHON" - <<'PY' 2>/dev/null || true
-PY
-
 echo "  Elapsed:  ${ELAPSED}s"
 echo "${BOLD}-----------------------------------------------------------${RESET}"
 
@@ -207,7 +244,7 @@ if [[ $RC -eq 0 ]]; then
 elif [[ $RC -eq 2 ]]; then
     echo "${YELLOW}${BOLD}PARTIAL — some devices or batches failed.${RESET}"
     echo "Records that were captured are safely in the logbook."
-    echo "Check the daemon logs (pm2 logs attendance-ztech) for details,"
+    echo "Check the daemon logs (e.g. pm2 logs ${PM2_APP:-attendance-sync}) for details,"
     echo "or simply run this tool again — it is safe to retry."
 else
     echo "${RED}${BOLD}FAILED — the sync did not complete (exit code $RC).${RESET}"
@@ -215,7 +252,7 @@ else
     echo "  • a biometric device is unreachable (check network / power)"
     echo "  • config.json has wrong IP / port / password"
     echo "  • the daemon is not yet running"
-    echo "Check pm2 logs attendance-ztech for the full error."
+    echo "Check pm2 logs (attendance-sync or attendance-ztech) for the full error."
 fi
 
 pause_and_exit "$RC"

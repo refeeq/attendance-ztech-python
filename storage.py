@@ -38,6 +38,38 @@ logger = logging.getLogger("AttendanceZTech.Storage")
 
 DEFAULT_DB_PATH = "data/attendance_queue.db"
 
+
+def verify_sqlite_queue_db(db_path: str) -> tuple[bool, str]:
+    """Return ``(True, 'ok')`` if ``db_path`` is absent or passes ``PRAGMA quick_check``.
+
+    Call this before constructing ``AttendanceQueue`` so a corrupted queue
+    file does not trap the daemon in a tight PM2 restart / log-spam loop.
+    """
+    path = Path(str(db_path)).expanduser()
+    if not path.is_file():
+        return True, "ok"
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=15.0)
+    except sqlite3.Error as exc:
+        return False, str(exc)
+    try:
+        rows = list(conn.execute("PRAGMA quick_check;"))
+    except sqlite3.Error as exc:
+        return False, str(exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not rows:
+        return False, "PRAGMA quick_check returned no rows"
+    messages = [str(r[0]) for r in rows]
+    if len(messages) == 1 and messages[0] == "ok":
+        return True, "ok"
+    return False, "; ".join(messages)
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS attendance_queue (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
