@@ -161,8 +161,10 @@ esac
 
 echo
 echo "${BOLD}Starting sync...${RESET}"
-echo "(This can take a few minutes depending on how many devices you have.)"
-echo "Progress will be shown below (device-by-device + heartbeat every 10s)."
+echo "Live progress appears below — per device: read count, date filter,"
+echo "new records, and logbook totals. After devices finish, ERP push"
+echo "progress is shown if records are still pending."
+echo
 
 PM2_APP="${ATTENDANCE_PM2_APP:-}"
 if [[ -z "$PM2_APP" ]] && command -v pm2 >/dev/null 2>&1; then
@@ -174,76 +176,123 @@ if [[ -z "$PM2_APP" ]] && command -v pm2 >/dev/null 2>&1; then
     done
 fi
 
-if [[ -n "$PM2_APP" ]]; then
-    echo "Attaching live daemon push logs ($PM2_APP) ..."
-    pm2 logs "$PM2_APP" --lines 0 2>/dev/null &
-    PM2_TAIL_PID=$!
-    sleep 1
-    if ! kill -0 "$PM2_TAIL_PID" >/dev/null 2>&1; then
-        PM2_TAIL_PID=""
-        echo "(Could not attach PM2 logs; continuing with sync logs only.)"
+queue_stats() {
+    PROJECT_DIR="$PROJECT_DIR" "$PYTHON" -c '
+import json, os, sys
+sys.path.insert(0, os.environ["PROJECT_DIR"])
+os.chdir(os.environ["PROJECT_DIR"])
+from storage import DEFAULT_DB_PATH, AttendanceQueue
+with open("config.json") as f:
+    cfg = json.load(f)
+db = str((cfg.get("sync") or {}).get("db_path", DEFAULT_DB_PATH))
+if not os.path.isabs(db):
+    db = os.path.join(os.environ["PROJECT_DIR"], db)
+q = AttendanceQueue(db)
+print(q.count_unsynced(), q.count_synced())
+' 2>/dev/null
+}
+
+wait_for_erp_drain() {
+    local pending_start="$1"
+    local timeout_s="${ATTENDANCE_ERP_WAIT_S:-900}"
+    local interval_s=5
+    local waited=0
+    local last_pending="$pending_start"
+    local pushed_total=0
+
+    if [[ "$pending_start" -le 0 ]]; then
+        echo "No pending records — ERP is already up to date."
+        return 0
     fi
-else
-    echo "(PM2 not found or no known app running; set ATTENDANCE_PM2_APP if needed.)"
-fi
-echo
+
+    echo
+    echo "${BOLD}Waiting for daemon to push records to ERP...${RESET}"
+    if [[ -n "$PM2_APP" ]]; then
+        echo "(PM2 app: $PM2_APP — pushes every ~15s in batches)"
+    else
+        echo "${YELLOW}Warning:${RESET} PM2 daemon not detected; records stay pending until it runs."
+    fi
+    echo "Pending at start: ${pending_start}"
+    echo
+
+    while [[ "$waited" -lt "$timeout_s" ]]; do
+        read -r pending synced _ <<< "$(queue_stats || echo '-1 -1')"
+        if [[ "$pending" == "-1" ]]; then
+            echo "  (could not read logbook)"
+            break
+        fi
+
+        if [[ "$pending" -le 0 ]]; then
+            echo
+            echo "${GREEN}All ${pending_start} pending record(s) pushed to ERP.${RESET}"
+            return 0
+        fi
+
+        pushed_this_round=$(( last_pending - pending ))
+        if [[ "$pushed_this_round" -lt 0 ]]; then
+            pushed_this_round=0
+        fi
+        pushed_total=$(( pushed_total + pushed_this_round ))
+        pct=0
+        if [[ "$pending_start" -gt 0 ]]; then
+            pct=$(( (pending_start - pending) * 100 / pending_start ))
+        fi
+
+        printf '[%s] ERP push: %3d%% done │ pending=%s │ pushed≈%s │ synced total=%s │ wait=%ss\n' \
+            "$(date '+%H:%M:%S')" "$pct" "$pending" "$pushed_total" "$synced" "$waited"
+
+        last_pending="$pending"
+        sleep "$interval_s"
+        waited=$(( waited + interval_s ))
+    done
+
+    read -r pending_final _ <<< "$(queue_stats || echo '-1 -1')"
+    if [[ "$pending_final" -gt 0 ]]; then
+        echo
+        echo "${YELLOW}ERP push still in progress (${pending_final} pending after ${timeout_s}s).${RESET}"
+        echo "The daemon will continue in the background."
+        if [[ -n "$PM2_APP" ]]; then
+            echo "Watch live: pm2 logs $PM2_APP"
+        fi
+        return 1
+    fi
+    return 0
+}
+
+read -r PENDING_BEFORE _ _ <<< "$(queue_stats || echo '0 0')"
 
 START_TS=$(date +%s)
 
-# --no-push  → only write into the local logbook; let the running PM2 daemon
-#              drain it to the ERP. This avoids racing with the daemon and
-#              guarantees no duplicate POSTs.
-PYTHONUNBUFFERED=1 "$PYTHON" "$PROJECT_DIR/sync_all.py" --no-push --from "$FROM_DATE" --to "$TODAY" &
-SYNC_PID=$!
-
-# Heartbeat so admins never stare at a blank terminal during long device pulls.
-while kill -0 "$SYNC_PID" >/dev/null 2>&1; do
-    NOW_TS=$(date +%s)
-    RUN_FOR=$(( NOW_TS - START_TS ))
-    printf '[%s] Still syncing... elapsed=%ss\n' "$(date '+%H:%M:%S')" "$RUN_FOR"
-    sleep 10
-done
-
-wait "$SYNC_PID"
+# --no-push → enqueue only; PM2 daemon drains to ERP (monitored below).
+PYTHONUNBUFFERED=1 "$PYTHON" "$PROJECT_DIR/sync_all.py" --no-push --from "$FROM_DATE" --to "$TODAY"
 RC=$?
 
 END_TS=$(date +%s)
 ELAPSED=$(( END_TS - START_TS ))
 
+read -r PENDING_AFTER SYNCED_AFTER _ <<< "$(queue_stats || echo '0 0')"
+
+ERP_DRAIN_RC=0
+if [[ "$PENDING_AFTER" -gt 0 ]]; then
+    wait_for_erp_drain "$PENDING_AFTER" || ERP_DRAIN_RC=$?
+fi
+
+read -r PENDING_FINAL SYNCED_FINAL _ <<< "$(queue_stats || echo '0 0')"
+
 echo
 echo "${BOLD}-----------------------------------------------------------${RESET}"
-
-# Show the durable-queue stats (works even without sqlite3 binary because it's
-# just a plain query through Python).
-"$PYTHON" - <<'PY' 2>/dev/null || true
-import json, os, sqlite3, sys
-cfg_path = os.path.join(os.environ.get("PROJECT_DIR", "."), "config.json")
-try:
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    db_path = cfg.get("sync", {}).get("db_path", "data/attendance_queue.db")
-    if not os.path.isabs(db_path):
-        db_path = os.path.join(os.environ.get("PROJECT_DIR", "."), db_path)
-    if not os.path.exists(db_path):
-        print(f"  (logbook not found at {db_path}, nothing to report)")
-        sys.exit(0)
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    pending = cur.execute("SELECT COUNT(*) FROM attendance_queue WHERE synced=0").fetchone()[0]
-    synced  = cur.execute("SELECT COUNT(*) FROM attendance_queue WHERE synced=1").fetchone()[0]
-    print(f"  Logbook:  pending={pending}   already-synced={synced}")
-    conn.close()
-except Exception as e:
-    print(f"  (could not read logbook: {e})")
-PY
-
-echo "  Elapsed:  ${ELAPSED}s"
+echo "  Pull phase elapsed     : ${ELAPSED}s"
+echo "  Logbook pending (ERP)  : ${PENDING_FINAL}"
+echo "  Logbook synced (ERP)   : ${SYNCED_FINAL}"
 echo "${BOLD}-----------------------------------------------------------${RESET}"
 
-if [[ $RC -eq 0 ]]; then
-    echo "${GREEN}${BOLD}DONE — sync completed successfully.${RESET}"
-    echo "Records are now in the local logbook. The running daemon will push"
-    echo "any pending records to the ERP within the next minute."
+if [[ $RC -eq 0 && "$ERP_DRAIN_RC" -eq 0 && "$PENDING_FINAL" -eq 0 ]]; then
+    echo "${GREEN}${BOLD}DONE — devices synced and ERP is up to date.${RESET}"
+elif [[ $RC -eq 0 ]]; then
+    echo "${GREEN}${BOLD}DONE — device pull completed.${RESET}"
+    if [[ "$PENDING_FINAL" -gt 0 ]]; then
+        echo "${PENDING_FINAL} record(s) still pending ERP push (daemon will continue)."
+    fi
 elif [[ $RC -eq 2 ]]; then
     echo "${YELLOW}${BOLD}PARTIAL — some devices or batches failed.${RESET}"
     echo "Records that were captured are safely in the logbook."

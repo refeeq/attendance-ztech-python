@@ -25,7 +25,7 @@ import json
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
 import httpx
@@ -90,6 +90,19 @@ def parse_date(d: Optional[str]) -> Optional[datetime]:
     if not d:
         return None
     return datetime.strptime(d, "%Y-%m-%d")
+
+
+def parse_date_end(d: Optional[str]) -> Optional[datetime]:
+    """Inclusive end-of-day for ``--to`` date filters."""
+    dt = parse_date(d)
+    if dt is None:
+        return None
+    return dt + timedelta(days=1) - timedelta(seconds=1)
+
+
+def progress(msg: str) -> None:
+    """Operator-facing line on stdout (desktop / manual runs)."""
+    print(msg, flush=True)
 
 
 def in_range(
@@ -275,7 +288,7 @@ def main() -> int:
             return 2
 
     start_dt = parse_date(args.from_date)
-    end_dt = parse_date(args.to_date)
+    end_dt = parse_date_end(args.to_date)
 
     sync_cfg = config.get("sync") or {}
     db_path = str(sync_cfg.get("db_path", DEFAULT_DB_PATH))
@@ -296,25 +309,56 @@ def main() -> int:
     total_collected = 0
     total_enqueued = 0
     total_pushed = 0
+    devices_ok = 0
+    devices_failed = 0
+    n_devices = len(devices)
+
+    range_label = "all dates"
+    if args.from_date or args.to_date:
+        range_label = f"{args.from_date or '…'} → {args.to_date or '…'}"
+
+    progress("")
+    progress("=" * 62)
+    progress("  ATTENDANCE SYNC — pulling from biometric devices")
+    progress("=" * 62)
+    progress(f"  Devices      : {n_devices}")
+    progress(f"  Date range   : {range_label}")
+    progress(
+        f"  ERP push     : "
+        f"{'skipped (daemon will push)' if args.no_push else 'direct from this run'}"
+    )
+    progress("")
+
+    try:
+        pending_before = queue.count_unsynced()
+    except Exception:
+        pending_before = -1
 
     for idx, device in enumerate(devices, start=1):
-        logging.info(
-            f"[{device.get('device_id')}] Starting device {idx}/{len(devices)}"
-        )
+        dev_id = device.get("device_id")
+        dev_ip = device.get("ip_address", "?")
+        progress(f"── Device {idx}/{n_devices} │ ID {dev_id} │ {dev_ip} ──")
+        logging.info(f"[{dev_id}] Starting device {idx}/{n_devices}")
+
         try:
             raw_logs = collect_device_logs(device)
         except Exception as exc:
-            logging.error(
-                f"[{device.get('device_id')}] collect failed: {exc}"
-            )
+            logging.error(f"[{dev_id}] collect failed: {exc}")
+            progress(f"   ✗ FAILED — could not read device: {exc}")
             overall_ok = False
+            devices_failed += 1
             continue
 
         if raw_logs is None:
+            progress("   ✗ FAILED — device unreachable or read error")
             overall_ok = False
+            devices_failed += 1
             continue
 
+        raw_count = len(raw_logs)
         if not raw_logs:
+            progress("   ○ Device read OK — no punches stored on device")
+            devices_ok += 1
             continue
 
         if start_dt or end_dt:
@@ -328,13 +372,11 @@ def main() -> int:
                         filtered.append(rec)
                 except Exception as exc:
                     logging.warning(
-                        f"[{device.get('device_id')}] timestamp parse "
-                        f"error: {exc}"
+                        f"[{dev_id}] timestamp parse error: {exc}"
                     )
             logs = filtered
             logging.info(
-                f"[{device.get('device_id')}] Filtered: {len(logs)} / "
-                f"{len(raw_logs)}"
+                f"[{dev_id}] Filtered: {len(logs)} / {len(raw_logs)}"
             )
         else:
             logs = raw_logs
@@ -344,33 +386,47 @@ def main() -> int:
         except Exception:
             pass
 
-        total_collected += len(logs)
+        in_range_count = len(logs)
+        total_collected += in_range_count
+
         if not logs:
+            progress(
+                f"   ○ Read {raw_count:,} punch(es) on device — "
+                f"0 in selected date range"
+            )
+            devices_ok += 1
             continue
 
         try:
             new = queue.enqueue_many(logs)
             total_enqueued += new
+            already = in_range_count - new
+            pending_now = queue.count_unsynced()
             logging.info(
-                f"[{device.get('device_id')}] Enqueued {new} new records "
-                f"(of {len(logs)})."
+                f"[{dev_id}] Enqueued {new} new (of {in_range_count}), "
+                f"pending={pending_now}"
             )
-            try:
-                pending_now = queue.count_unsynced()
-                logging.info(
-                    f"[{device.get('device_id')}] Queue pending now: "
-                    f"{pending_now}"
-                )
-            except Exception:
-                pass
+            progress(f"   ✓ Read from device     : {raw_count:,} total punch(es)")
+            progress(f"   ✓ In date range        : {in_range_count:,}")
+            progress(f"   ✓ New in local logbook : {new:,}")
+            if already > 0:
+                progress(f"   · Already in logbook : {already:,} (skipped)")
+            progress(f"   · Logbook pending now : {pending_now:,}")
+            devices_ok += 1
         except Exception as exc:
-            logging.error(
-                f"[{device.get('device_id')}] enqueue failed: {exc}"
-            )
+            logging.error(f"[{dev_id}] enqueue failed: {exc}")
+            progress(f"   ✗ FAILED — could not save to logbook: {exc}")
             overall_ok = False
+            devices_failed += 1
             continue
 
         if args.no_push:
+            progress(
+                f"   → Running totals: collected={total_collected:,}  "
+                f"new={total_enqueued:,}  "
+                f"devices done={idx}/{n_devices}"
+            )
+            progress("")
             continue
 
         # Direct push fallback so this script is useful even if the daemon
@@ -378,6 +434,8 @@ def main() -> int:
         # synced once the ERP confirms 2xx, so the daemon won't re-send.
         ids_unsynced = _ids_for_records(queue, logs)
         if not ids_unsynced:
+            progress("   · Nothing to push for this device (already synced)")
+            progress("")
             continue
 
         with queue._conn() as conn:                          # noqa: SLF001
@@ -392,8 +450,12 @@ def main() -> int:
         records_with_ids = [dict(r) for r in rows]
 
         chunk_size = max(1, int(args.chunk or 500))
+        n_batches = (len(records_with_ids) + chunk_size - 1) // chunk_size
         device_ok = True
-        for batch in chunked(records_with_ids, chunk_size):
+        device_pushed = 0
+        for batch_num, batch in enumerate(
+            chunked(records_with_ids, chunk_size), start=1
+        ):
             payload = [
                 {
                     "device_id": r["device_id"],
@@ -404,29 +466,72 @@ def main() -> int:
                 }
                 for r in batch
             ]
+            progress(
+                f"   ↑ Pushing batch {batch_num}/{n_batches} "
+                f"({len(batch)} records) to ERP..."
+            )
             ok = push_batch(
                 endpoint, payload, retries=int(args.retries or 3)
             )
             if ok:
                 queue.mark_synced([r["id"] for r in batch])
+                device_pushed += len(batch)
                 total_pushed += len(batch)
+                progress(
+                    f"   ✓ Batch {batch_num}/{n_batches} OK "
+                    f"({device_pushed:,}/{len(records_with_ids):,} for device)"
+                )
             else:
                 device_ok = False
                 logging.error(
-                    f"[{device.get('device_id')}] batch push failed; "
-                    f"remaining records remain in the local queue and the "
-                    f"daemon will retry them."
+                    f"[{dev_id}] batch push failed; remaining records stay "
+                    f"in the queue for the daemon to retry."
                 )
+                progress(f"   ✗ Batch {batch_num}/{n_batches} FAILED")
                 break
 
         if not device_ok:
             overall_ok = False
 
+        progress(
+            f"   → Running totals: collected={total_collected:,}  "
+            f"new={total_enqueued:,}  pushed={total_pushed:,}  "
+            f"devices done={idx}/{n_devices}"
+        )
+        progress("")
+
     pending = -1
+    synced_total = -1
     try:
         pending = queue.count_unsynced()
+        synced_total = queue.count_synced()
     except Exception:
         pass
+
+    progress("=" * 62)
+    progress("  DEVICE PULL COMPLETE")
+    progress("=" * 62)
+    progress(f"  Devices OK / failed     : {devices_ok} / {devices_failed}")
+    progress(f"  Punches in date range   : {total_collected:,}")
+    progress(f"  New rows in logbook     : {total_enqueued:,}")
+    if not args.no_push:
+        progress(f"  Pushed to ERP (this run): {total_pushed:,}")
+    if pending >= 0:
+        progress(f"  Logbook pending (ERP)   : {pending:,}")
+    if synced_total >= 0:
+        progress(f"  Logbook already synced  : {synced_total:,}")
+    if pending_before >= 0 and pending >= 0:
+        delta_pending = pending - pending_before
+        if delta_pending > 0:
+            progress(
+                f"  Net new pending         : +{delta_pending:,} "
+                f"(was {pending_before:,} before this run)"
+            )
+    progress(
+        f"  Status                  : "
+        f"{'SUCCESS' if overall_ok else 'PARTIAL / ERRORS — see lines above'}"
+    )
+    progress("")
 
     logging.info(
         f"SYNC COMPLETE collected={total_collected} "

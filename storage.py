@@ -226,6 +226,14 @@ class AttendanceQueue:
                 ).fetchone()[0]
             )
 
+    def count_synced(self) -> int:
+        with self._conn() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM attendance_queue WHERE synced = 1;"
+                ).fetchone()[0]
+            )
+
     def mark_synced(self, ids: Sequence[int]) -> int:
         ids = [int(i) for i in ids]
         if not ids:
