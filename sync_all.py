@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
@@ -105,6 +107,53 @@ def progress(msg: str) -> None:
     print(msg, flush=True)
 
 
+class ProgressHeartbeat:
+    """Print elapsed-time updates while a blocking device call runs."""
+
+    def __init__(self, phase: str, interval_s: float = 10.0) -> None:
+        self._phase = phase
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._started = 0.0
+
+    def set_phase(self, phase: str) -> None:
+        self._phase = phase
+        self._started = time.monotonic()
+
+    def __enter__(self) -> "ProgressHeartbeat":
+        self._started = time.monotonic()
+
+        def _loop() -> None:
+            while not self._stop.wait(self._interval_s):
+                elapsed = int(time.monotonic() - self._started)
+                progress(
+                    f"   … still {self._phase} ({elapsed}s elapsed)"
+                )
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
+def device_ping_ok(ip: str, wait_s: int = 2) -> bool:
+    """Quick reachability check before opening a ZKTeco session."""
+    try:
+        rc = subprocess.call(
+            ["ping", "-c", "1", "-W", str(max(1, wait_s)), ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return rc == 0
+    except Exception:
+        return False
+
+
 def in_range(
     ts: datetime,
     start: Optional[datetime],
@@ -180,39 +229,69 @@ def push_batch(
 def collect_device_logs(device: dict) -> Optional[List[dict]]:
     """Fetch ALL logs from a device.
 
+    ZKTeco devices always send their full on-device history; the date window
+    is applied afterward in Python. ``get_attendance()`` can take many minutes
+    on busy devices — heartbeats keep the operator informed.
+
     Returns ``None`` if the device could not be read (connection errors, etc.).
     Returns ``[]`` if the read succeeded but the device had no attendance rows.
     """
+    dev_id = device["device_id"]
+    ip = device["ip_address"]
+    port = int(device.get("port", 4370) or 4370)
+    timeout = int(device.get("timeout", 100) or 100)
+
+    progress(f"   → Checking network reachability ({ip})...")
+    if not device_ping_ok(ip):
+        progress(
+            f"   ✗ Device not reachable via ping ({ip}). "
+            f"Check power, cable/Wi‑Fi, and IP in config.json."
+        )
+        logging.error(f"[{dev_id}] ping failed for {ip}")
+        return None
+    progress(f"   → Ping OK. Opening ZKTeco session on {ip}:{port}...")
+
     zk = ZK(
-        device["ip_address"],
-        port=int(device.get("port", 4370) or 4370),
-        timeout=int(device.get("timeout", 100) or 100),
+        ip,
+        port=port,
+        timeout=timeout,
         password=_safe_password(device),
         force_udp=bool(device.get("force_udp", False)),
         ommit_ping=bool(device.get("ommit_ping", False)),
     )
     conn = None
     try:
-        logging.info(
-            f"[{device['device_id']}] Connecting to {device['ip_address']}..."
-        )
-        conn = zk.connect()
+        with ProgressHeartbeat(f"connecting to {ip}:{port}"):
+            conn = zk.connect()
         if not conn:
-            logging.error(
-                f"[{device['device_id']}] connect() returned None"
+            progress(
+                f"   ✗ Could not connect to {ip}:{port} "
+                f"(timeout={timeout}s). Check port/password."
             )
+            logging.error(f"[{dev_id}] connect() returned None")
             return None
-        conn.enable_device()
-        logs = conn.get_attendance() or []
-        logging.info(
-            f"[{device['device_id']}] Retrieved {len(logs)} raw logs."
+
+        progress(
+            f"   → Connected. Downloading ALL punches stored on device "
+            f"(not just 7/60 days — device protocol limitation)..."
         )
+        progress(
+            "   → This step can take 5–20+ minutes on busy devices; "
+            "heartbeat lines below mean it is still working."
+        )
+        with ProgressHeartbeat(f"downloading attendance from {ip}"):
+            conn.enable_device()
+            logs = conn.get_attendance() or []
+
+        progress(f"   → Download complete: {len(logs):,} punch(es) on device.")
+        logging.info(f"[{dev_id}] Retrieved {len(logs)} raw logs from {ip}")
+
         out: List[dict] = []
         for log in logs:
             try:
                 out.append(
                     {
-                        "device_id": device["device_id"],
+                        "device_id": dev_id,
                         "user_id": int(log.user_id),
                         "timestamp": log.timestamp.strftime(
                             "%Y-%m-%d %H:%M:%S"
@@ -222,24 +301,19 @@ def collect_device_logs(device: dict) -> Optional[List[dict]]:
                     }
                 )
             except Exception as exc:
-                logging.warning(
-                    f"[{device['device_id']}] skip malformed log: {exc}"
-                )
+                logging.warning(f"[{dev_id}] skip malformed log: {exc}")
         return out
     except Exception as exc:
-        logging.error(
-            f"[{device['device_id']}] Error collecting logs: {exc}"
-        )
+        progress(f"   ✗ Device read failed: {exc}")
+        logging.error(f"[{dev_id}] Error collecting logs: {exc}")
         return None
     finally:
         if conn is not None:
             try:
                 conn.disconnect()
-                logging.info(f"[{device['device_id']}] Disconnected.")
+                logging.debug(f"[{dev_id}] Disconnected from {ip}")
             except Exception as exc:
-                logging.warning(
-                    f"[{device['device_id']}] disconnect issue: {exc}"
-                )
+                logging.warning(f"[{dev_id}] disconnect issue: {exc}")
 
 
 def _ids_for_records(
@@ -362,6 +436,11 @@ def main() -> int:
             continue
 
         if start_dt or end_dt:
+            if len(raw_logs) > 1000:
+                progress(
+                    f"   → Filtering {len(raw_logs):,} punches to date range "
+                    f"{args.from_date or '…'} → {args.to_date or '…'}..."
+                )
             filtered: List[dict] = []
             for rec in raw_logs:
                 try:

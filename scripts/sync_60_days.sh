@@ -161,9 +161,10 @@ esac
 
 echo
 echo "${BOLD}Starting sync...${RESET}"
-echo "Live progress appears below — per device: read count, date filter,"
-echo "new records, and logbook totals. After devices finish, ERP push"
-echo "progress is shown if records are still pending."
+echo "Live progress appears below. Note: each device downloads ALL punches"
+echo "stored on the device first (ZKTeco limitation), then filters to your"
+echo "date range — busy devices can take 5–20+ minutes with heartbeat lines."
+echo "After devices finish, ERP push progress is shown if records are pending."
 echo
 
 PM2_APP="${ATTENDANCE_PM2_APP:-}"
