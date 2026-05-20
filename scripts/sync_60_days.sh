@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # ----------------------------------------------------------------------------
-# Manual "Sync last 60 days" tool for school IT admins.
+# Manual backfill tool for school IT admins (default: last 60 days).
+#
+# For a 7-day window, use scripts/sync_7_days.sh (or set
+# ATTENDANCE_BACKFILL_DAYS=7 before running this script).
 #
 # What it does (in plain language):
 #   1. Asks the admin "are you sure?"
 #   2. Connects to every biometric device listed in config.json
-#   3. Pulls the last 60 days of attendance from each device
+#   3. Pulls the last N days of attendance from each device (N=60 by default)
 #   4. Stores them in the local logbook (data/attendance_queue.db)
 #   5. The PM2 daemon then pushes them to the ERP, idempotently
 #   6. Pauses at the end so the admin can read the result.
@@ -129,7 +132,7 @@ if not ok:
     print("  2) Backup then remove the queue files, for example:")
     print("     ", db)
     print("     ", db + "-wal", "and", db + "-shm", "(if they exist)")
-    print("  3) pm2 start …  then run this 60-day sync again.")
+    print("  3) pm2 start …  then run this backfill sync again.")
     print()
     sys.exit(1)
 '; then

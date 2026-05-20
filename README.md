@@ -444,11 +444,50 @@ pm2 stop attendance-ztech
 pm2 delete attendance-ztech
 ```
 
-To also enable the desktop icon + manual 60-day backfill launcher:
+#### Desktop shortcuts — Sync Last 7 / 60 Days (GUI schools)
+
+On a Linux machine with a desktop (GNOME, etc.), school IT can install
+double-clickable launchers that pull attendance from every device into the
+local logbook. The running PM2 daemon then pushes those records to the ERP.
+Safe to run while the service is running; duplicates are ignored.
+
+| Shortcut | Use when |
+|----------|----------|
+| **Sync Last 7 Days** | Quick catch-up (past week) — e.g. after a short outage |
+| **Sync Last 60 Days** | Full backfill (two months) — e.g. long downtime or new install |
+
+**Install once** (run as the user who logs into the GUI, not necessarily root):
 
 ```bash
 cd /Projects/attendance-ztech-python
 bash scripts/install_desktop_shortcut.sh
+```
+
+This places **both** icons on the Desktop and in the applications menu.
+On GNOME, you may need to right-click each icon → **Allow Launching** the first time.
+
+**What each shortcut runs** (paths are patched to your install directory):
+
+```bash
+# 7-day catch-up
+bash -c "/Projects/attendance-ztech-python/scripts/sync_7_days.sh; exec bash"
+
+# 60-day backfill
+bash -c "/Projects/attendance-ztech-python/scripts/sync_60_days.sh; exec bash"
+```
+
+Each wrapper prompts for confirmation, then runs (example for 7 days):
+
+```bash
+venv/bin/python sync_all.py --no-push --from <7-days-ago> --to <today>
+```
+
+**Same workflow from a terminal** (no shortcut):
+
+```bash
+cd /Projects/attendance-ztech-python
+bash scripts/sync_7_days.sh    # past week
+bash scripts/sync_60_days.sh   # past 60 days
 ```
 
 ### Option B — Linux server with systemd (alternative)
@@ -887,6 +926,13 @@ python sync_all.py --device-id 1 --from 2026-04-20 --to 2026-04-26
 # Pull from devices but DO NOT push directly — let the daemon drain
 python sync_all.py --no-push --from 2026-04-20 --to 2026-04-26
 
+# Backfill with prompts (same as the Desktop shortcuts)
+bash scripts/sync_7_days.sh
+bash scripts/sync_60_days.sh
+
+# Install Desktop shortcuts — 7-day and 60-day (Linux GUI, once per user)
+bash scripts/install_desktop_shortcut.sh
+
 # Test that Telegram is wired up correctly
 python test_telegram.py
 ```
@@ -1066,6 +1112,9 @@ A: Two places:
 | View file logs | `tail -f logs/attendance.log` |
 | Pending records | `sqlite3 data/attendance_queue.db "SELECT COUNT(*) FROM attendance_queue WHERE synced=0;"` |
 | Manual range sync | `python sync_all.py --from 2026-04-01 --to 2026-04-26` |
+| 7-day backfill (guided) | `bash scripts/sync_7_days.sh` |
+| 60-day backfill (guided) | `bash scripts/sync_60_days.sh` |
+| Install Desktop shortcuts (7 + 60 day) | `bash scripts/install_desktop_shortcut.sh` |
 | Manual full backfill | `python boot_sync_30d.py` |
 | Test Telegram | `python test_telegram.py` |
 | Add a device | Edit `config.json` → restart service |

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Attendance — Sync Last 7 Days
+GenericName=Attendance Backfill
+Comment=Pull the last 7 days of attendance from all biometric devices into the local queue. Safe to run while the service is running.
+Exec=bash -c "__PROJECT_DIR__/scripts/sync_7_days.sh; exec bash"
+Terminal=true
+Icon=appointment-soon
+Categories=Utility;System;
+Keywords=attendance;sync;backfill;ztech;biometric;week;
+StartupNotify=true
