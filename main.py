@@ -45,7 +45,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from zk import ZK
 
-from storage import DEFAULT_DB_PATH, AttendanceQueue, verify_sqlite_queue_db
+from storage import (
+    DEFAULT_DB_PATH,
+    AttendanceQueue,
+    checkpoint_wal,
+    ensure_sqlite_queue_db,
+    is_sqlite_corruption_error,
+    verify_sqlite_queue_db,
+)
 from telegram_notifier import TelegramNotifier
 
 
@@ -159,6 +166,16 @@ WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
 RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
 BOOT_RECOVERY_DAYS   = max(1,  int(_SYNC_CFG.get("boot_recovery_days", 3)))
+POST_DB_RESET_RECOVERY_DAYS = max(
+    BOOT_RECOVERY_DAYS,
+    int(_SYNC_CFG.get("post_db_reset_recovery_days", 60)),
+)
+WAL_CHECKPOINT_INTERVAL_S = max(
+    300, int(_SYNC_CFG.get("wal_checkpoint_interval_s", 3600))
+)
+DB_INTEGRITY_CHECK_INTERVAL_S = max(
+    3600, int(_SYNC_CFG.get("db_integrity_check_interval_s", 86400))
+)
 DB_PATH              = str(_SYNC_CFG.get("db_path", DEFAULT_DB_PATH))
 
 if not ENDPOINT:
@@ -281,19 +298,18 @@ def any_device_ping_ok(hosts: List[str], max_wait_s: int = 60) -> bool:
 # Queue (parent-side instance)
 # ---------------------------------------------------------------------------
 
-_sql_ok, _sql_msg = verify_sqlite_queue_db(DB_PATH)
-if not _sql_ok:
+_db_ready, _db_action, _db_detail = ensure_sqlite_queue_db(DB_PATH)
+if not _db_ready:
     _fix = (
-        f"SQLite queue unusable: {_sql_msg}. File: {DB_PATH}. "
-        "Stop PM2, backup then remove the .db and -wal/-shm siblings, "
-        "restart to recreate an empty queue, then run sync_all or the "
-        "60-day sync script to backfill from devices."
+        f"SQLite queue unusable after auto-repair: {_db_detail}. "
+        f"File: {DB_PATH}. Check disk space and permissions, then run "
+        f"scripts/repair_queue_db.py or sync_all for backfill."
     )
     logger.critical(_fix)
     try:
         tg_send(
-            f"🔴 <b>Queue database corrupt</b>\n"
-            f"<code>{_sql_msg[:400]}</code>\n"
+            f"🔴 <b>Queue database repair failed</b>\n"
+            f"<code>{_db_detail[:400]}</code>\n"
             f"Path: <code>{DB_PATH}</code>\n"
             "Daemon refusing to start.",
             kind="sqlite_corrupt",
@@ -303,7 +319,76 @@ if not _sql_ok:
         pass
     sys.exit(1)
 
+if _db_action == "recovered":
+    logger.warning("SQLite queue auto-recovered: %s", _db_detail)
+    try:
+        tg_send(
+            f"🟡 <b>Queue database auto-recovered</b>\n"
+            f"<code>{_db_detail[:400]}</code>\n"
+            f"Path: <code>{DB_PATH}</code>\n"
+            "Daemon starting normally.",
+            kind="sqlite_recovered",
+            min_interval_s=0,
+        )
+    except Exception:
+        pass
+elif _db_action == "reset":
+    logger.warning(
+        "SQLite queue was reset (empty). Backfill will run: %s", _db_detail
+    )
+    try:
+        tg_send(
+            f"🟠 <b>Queue database reset</b>\n"
+            f"Corrupt local queue was quarantined and replaced with a "
+            f"fresh empty database.\n"
+            f"<code>{_db_detail[:400]}</code>\n"
+            f"Path: <code>{DB_PATH}</code>\n"
+            f"A {POST_DB_RESET_RECOVERY_DAYS}-day device backfill will run "
+            f"at startup.",
+            kind="sqlite_reset",
+            min_interval_s=0,
+        )
+    except Exception:
+        pass
+
 queue = AttendanceQueue(DB_PATH)
+_queue_db_needs_extended_recovery = _db_action == "reset"
+
+
+def _repair_queue_if_corrupt(context: str) -> bool:
+    """Try to heal the queue in-process; return True if service can continue."""
+    global _queue_db_needs_extended_recovery
+    logger.critical(
+        "SQLite corruption detected during %s — attempting auto-repair", context
+    )
+    try:
+        tg_send(
+            f"🟠 <b>Queue corruption at runtime</b>\n"
+            f"Context: <code>{context}</code>\n"
+            f"Attempting automatic repair…",
+            kind="sqlite_runtime_repair",
+            min_interval_s=0,
+        )
+    except Exception:
+        pass
+    ok, action, detail = ensure_sqlite_queue_db(DB_PATH)
+    if not ok:
+        logger.critical("Runtime queue repair failed: %s", detail)
+        return False
+    logger.warning("Runtime queue repair succeeded (%s): %s", action, detail)
+    if action == "reset":
+        _queue_db_needs_extended_recovery = True
+    try:
+        tg_send(
+            f"✅ <b>Queue auto-repair OK</b>\n"
+            f"Action: <code>{action}</code>\n"
+            f"<code>{detail[:400]}</code>",
+            kind="sqlite_runtime_repair_ok",
+            min_interval_s=0,
+        )
+    except Exception:
+        pass
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +481,8 @@ def pusher_loop(stop_event: threading.Event) -> None:
                 pending = queue.count_unsynced()
             except Exception as exc:
                 logger.error(f"Pusher: count_unsynced failed: {exc}")
+                if is_sqlite_corruption_error(exc):
+                    _repair_queue_if_corrupt("pusher count_unsynced")
                 stop_event.wait(timeout=5)
                 continue
 
@@ -410,6 +497,8 @@ def pusher_loop(stop_event: threading.Event) -> None:
                             )
                     except Exception as exc:
                         logger.warning(f"Purge error: {exc}")
+                        if is_sqlite_corruption_error(exc):
+                            _repair_queue_if_corrupt("pusher purge")
                     last_purge = now
                 stop_event.wait(timeout=1.0)
                 continue
@@ -428,6 +517,8 @@ def pusher_loop(stop_event: threading.Event) -> None:
                 records = queue.fetch_unsynced(PUSH_BATCH_SIZE)
             except Exception as exc:
                 logger.error(f"Pusher: fetch_unsynced failed: {exc}")
+                if is_sqlite_corruption_error(exc):
+                    _repair_queue_if_corrupt("pusher fetch_unsynced")
                 stop_event.wait(timeout=5)
                 continue
 
@@ -454,6 +545,8 @@ def pusher_loop(stop_event: threading.Event) -> None:
                     logger.error(
                         f"Pusher: mark_synced failed (will retry): {exc}"
                     )
+                    if is_sqlite_corruption_error(exc):
+                        _repair_queue_if_corrupt("pusher mark_synced")
                     stop_event.wait(timeout=5)
                     continue
 
@@ -771,24 +864,34 @@ def stop_processes(
 # Boot recovery (rate-limited so a crash-loop doesn't thrash the devices)
 # ---------------------------------------------------------------------------
 
-def maybe_run_boot_recovery() -> None:
-    last_recovery = queue.get_state("last_boot_recovery_at")
-    if last_recovery:
-        try:
-            last_dt = datetime.fromisoformat(last_recovery)
-            if datetime.now() - last_dt < timedelta(minutes=30):
-                logger.info(
-                    f"⚙️ Skipping boot recovery (last ran {last_recovery})"
-                )
-                return
-        except Exception:
-            pass
+def maybe_run_boot_recovery(force_extended: bool = False) -> None:
+    global _queue_db_needs_extended_recovery
+    lookback = BOOT_RECOVERY_DAYS
+    if force_extended or _queue_db_needs_extended_recovery:
+        lookback = POST_DB_RESET_RECOVERY_DAYS
+        logger.info(
+            f"⚙️ Extended boot recovery after queue reset "
+            f"(lookback={lookback}d)"
+        )
+        _queue_db_needs_extended_recovery = False
+    else:
+        last_recovery = queue.get_state("last_boot_recovery_at")
+        if last_recovery:
+            try:
+                last_dt = datetime.fromisoformat(last_recovery)
+                if datetime.now() - last_dt < timedelta(minutes=30):
+                    logger.info(
+                        f"⚙️ Skipping boot recovery (last ran {last_recovery})"
+                    )
+                    return
+            except Exception:
+                pass
+        logger.info(
+            f"⚙️ Boot EoD recovery (lookback={lookback}d)"
+        )
 
-    logger.info(
-        f"⚙️ Boot EoD recovery (lookback={BOOT_RECOVERY_DAYS}d)"
-    )
     try:
-        end_of_day_task(lookback_days=BOOT_RECOVERY_DAYS)
+        end_of_day_task(lookback_days=lookback)
     except Exception as exc:
         logger.exception(f"Boot recovery error: {exc}")
     finally:
@@ -853,11 +956,13 @@ def main() -> None:
     processes: Dict[Any, Process] = {}
     supervise_processes(processes)
 
-    maybe_run_boot_recovery()
+    maybe_run_boot_recovery(force_extended=_db_action == "reset")
 
     last_reconnect = time.time()
     last_watchdog = 0.0
     last_eod_attempt = 0.0
+    last_wal_checkpoint = time.time()
+    last_integrity_check = time.time()
     last_eod_done_marker: Optional[str] = queue.get_state("last_eod_date")
 
     try:
@@ -880,6 +985,23 @@ def main() -> None:
                     processes.clear()
                     supervise_processes(processes)
                     last_reconnect = now
+
+                if now - last_wal_checkpoint >= WAL_CHECKPOINT_INTERVAL_S:
+                    try:
+                        checkpoint_wal(DB_PATH)
+                        last_wal_checkpoint = now
+                    except Exception as exc:
+                        logger.warning(f"WAL checkpoint failed: {exc}")
+                        if is_sqlite_corruption_error(exc):
+                            _repair_queue_if_corrupt("wal checkpoint")
+
+                if now - last_integrity_check >= DB_INTEGRITY_CHECK_INTERVAL_S:
+                    last_integrity_check = now
+                    ok_db, db_msg = verify_sqlite_queue_db(DB_PATH)
+                    if not ok_db:
+                        _repair_queue_if_corrupt(
+                            f"scheduled integrity check: {db_msg}"
+                        )
 
                 # Daily EoD: anywhere in 23:55-23:59, run once per day,
                 # retry every minute within the window if it fails.

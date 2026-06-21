@@ -14,8 +14,7 @@
 #   6. Pauses at the end so the admin can read the result.
 #
 # Safe to run multiple times — duplicates are silently ignored.
-# If the SQLite queue file is corrupt, this script exits before syncing
-# (fix the queue first; see README / operator runbook).
+# If the SQLite queue file is corrupt, it is auto-repaired before sync.
 # ----------------------------------------------------------------------------
 
 set -u
@@ -115,26 +114,26 @@ if ! PROJECT_DIR="$PROJECT_DIR" "$PYTHON" -c '
 import json, os, sys
 sys.path.insert(0, os.environ["PROJECT_DIR"])
 os.chdir(os.environ["PROJECT_DIR"])
-from storage import DEFAULT_DB_PATH, verify_sqlite_queue_db
+from storage import DEFAULT_DB_PATH, ensure_sqlite_queue_db
 with open("config.json") as f:
     cfg = json.load(f)
 db = str((cfg.get("sync") or {}).get("db_path", DEFAULT_DB_PATH))
 if not os.path.isabs(db):
     db = os.path.join(os.environ["PROJECT_DIR"], db)
-ok, msg = verify_sqlite_queue_db(db)
+ok, action, detail = ensure_sqlite_queue_db(db)
 if not ok:
     print()
-    print("FATAL: local attendance queue database is damaged:")
-    print(" ", msg)
+    print("FATAL: local attendance queue could not be repaired:")
+    print(" ", detail)
     print()
-    print("Fix:")
-    print("  1) pm2 stop attendance-sync   (or: pm2 stop all)")
-    print("  2) Backup then remove the queue files, for example:")
-    print("     ", db)
-    print("     ", db + "-wal", "and", db + "-shm", "(if they exist)")
-    print("  3) pm2 start …  then run this backfill sync again.")
+    print("Try on the server:")
+    print("  cd", os.environ["PROJECT_DIR"])
+    print("  ./venv/bin/python scripts/repair_queue_db.py")
     print()
     sys.exit(1)
+if action in ("recovered", "reset"):
+    print("Note: queue was auto-repaired (" + action + ").")
+    print(" ", detail)
 '; then
     pause_and_exit 1
 fi
