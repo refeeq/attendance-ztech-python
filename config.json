@@ -22,6 +22,12 @@
   "buffer_limit": 3,
   "log_level": "INFO",
 
+  "sync": {
+    "boot_sync_days": 60,
+    "boot_recovery_days": 60,
+    "eod_lookback_days": 1
+  },
+
   "telegram": {
     "bot_token": "7985099852:AAFL_aTu4g5pB-3xaKoUVrZy94oWGOa3HfY",
     "chat_id": "-1003063465563",

@@ -15,11 +15,12 @@ Pipeline
    the case where ZKTeco's TCP stack silently drops the live capture).
 4. End-of-Day (23:55-23:59) re-pulls each device's stored punches and
    re-enqueues them idempotently as a safety net for any RT punches missed
-   by network glitches. Boot recovery does the same with a 3-day lookback
-   if the daemon was offline for a while.
-5. ``boot_sync_30d.py`` (a separate oneshot service at boot time) provides
-   60-day historical backfill via ``sync_all.py``; that path also feeds the
-   same durable queue.
+   by network glitches. Capture workers are paused for that pull so the
+   device is free.
+5. On every daemon start live capture begins immediately. A background
+   thread then pulls ``boot_sync_days`` (default 60) of history into the
+   queue; the pusher drains those rows to the ERP without blocking punches.
+   The legacy ``boot_sync_30d.py`` oneshot still exists for systemd/cron.
 
 The queue is the single source of truth for "did we ship it?". Restarts,
 crashes, and power-loss never discard pending records.
@@ -166,8 +167,12 @@ WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
 RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
 BOOT_RECOVERY_DAYS   = max(1,  int(_SYNC_CFG.get("boot_recovery_days", 3)))
-POST_DB_RESET_RECOVERY_DAYS = max(
+BOOT_SYNC_DAYS       = max(
     BOOT_RECOVERY_DAYS,
+    int(_SYNC_CFG.get("boot_sync_days", 60)),
+)
+POST_DB_RESET_RECOVERY_DAYS = max(
+    BOOT_SYNC_DAYS,
     int(_SYNC_CFG.get("post_db_reset_recovery_days", 60)),
 )
 WAL_CHECKPOINT_INTERVAL_S = max(
@@ -201,6 +206,7 @@ logger.info(
     f"Config: devices={len(DEVICES)} endpoint={ENDPOINT} "
     f"batch_size={PUSH_BATCH_SIZE} push_interval_s={PUSH_INTERVAL_S} "
     f"reconnect_interval_s={RECONNECT_INTERVAL_S} db={DB_PATH} "
+    f"boot_sync_days={BOOT_SYNC_DAYS} eod_lookback_days={EOD_LOOKBACK_DAYS} "
     f"retention={_retention} "
     f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
 )
@@ -353,6 +359,14 @@ elif _db_action == "reset":
 
 queue = AttendanceQueue(DB_PATH)
 _queue_db_needs_extended_recovery = _db_action == "reset"
+
+# Capture workers the watchdog must not respawn (device is mid history-pull).
+_paused_device_ids: set = set()
+_paused_lock = threading.Lock()
+_processes_lock = threading.Lock()
+# Set while boot-sync / EoD holds a device, so the 15-min reconnect does
+# not kill live capture on the other terminals.
+_history_pull_active = threading.Event()
 
 
 def _repair_queue_if_corrupt(context: str) -> bool:
@@ -751,44 +765,72 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
     return new_count
 
 
-def end_of_day_task(lookback_days: Optional[int] = None) -> bool:
+def end_of_day_task(
+    lookback_days: Optional[int] = None,
+    *,
+    purpose: str = "eod",
+    processes: Optional[Dict[Any, Process]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
     lookback = max(1, int(lookback_days or EOD_LOOKBACK_DAYS))
     today = date.today()
     target_dates = {
         (today - timedelta(days=i)).isoformat() for i in range(lookback)
     }
+    is_boot = purpose == "boot"
+    label = f"{lookback}-Day Boot Sync" if is_boot else "End-of-Day"
+    emoji = "🚀" if is_boot else "🧹"
+    kind_start = "boot_sync_start" if is_boot else "eod_start"
+    kind_done = "boot_sync_done" if is_boot else "eod_done"
+
     logger.info(
-        f"🧹 EoD start (lookback={lookback}d, dates={sorted(target_dates)})"
+        f"{emoji} {label} start (lookback={lookback}d, "
+        f"dates={sorted(target_dates)[0]} … {sorted(target_dates)[-1]})"
     )
     tg_send(
-        f"🧹 <b>End-of-Day Started</b>\n"
+        f"{emoji} <b>{label} Started</b>\n"
         f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
         f"🖥️ Devices: {len(DEVICES)}\n"
-        f"📅 Lookback: {lookback}d",
-        kind="eod_start",
+        f"📅 Lookback: {lookback}d\n"
+        f"📆 {sorted(target_dates)[0]} → {sorted(target_dates)[-1]}\n"
+        f"🟢 Live capture stays running.",
+        kind=kind_start,
         min_interval_s=60,
     )
 
     ok = 0
     fail = 0
     total_new = 0
-    for d in DEVICES:
-        try:
-            total_new += _eod_one_device(d, target_dates)
-            ok += 1
-        except Exception as exc:
-            fail += 1
-            logger.error(
-                f"❌ EoD device {d.get('device_id')} error: {exc}"
-            )
+    already_pulling = _history_pull_active.is_set()
+    _history_pull_active.set()
+    try:
+        for d in DEVICES:
+            if stop_event is not None and stop_event.is_set():
+                logger.warning(f"{label} aborted (shutdown)")
+                fail += 1
+                break
+            try:
+                total_new += _pull_one_device_history(
+                    d, target_dates, processes
+                )
+                ok += 1
+            except Exception as exc:
+                fail += 1
+                logger.error(
+                    f"❌ {label} device {d.get('device_id')} error: {exc}"
+                )
+    finally:
+        if not already_pulling:
+            _history_pull_active.clear()
 
     tg_send(
-        f"🧹 <b>End-of-Day Complete</b>\n"
+        f"{emoji} <b>{label} Complete</b>\n"
         f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
         f"✅ OK devices: {ok}\n"
         f"❌ Failed devices: {fail}\n"
-        f"🧾 New records enqueued: {total_new}",
-        kind="eod_done",
+        f"🧾 New records enqueued: {total_new}\n"
+        f"📤 Pending rows are pushing to ERP in the background.",
+        kind=kind_done,
         min_interval_s=60,
     )
     return fail == 0
@@ -813,11 +855,74 @@ def spawn_capture_process(device: dict) -> Process:
     return p
 
 
+def _pause_capture_device(processes: Dict[Any, Process], device: dict) -> None:
+    """Stop live capture on one device so get_attendance() can use the session."""
+    did = device.get("device_id")
+    with _paused_lock:
+        _paused_device_ids.add(did)
+    with _processes_lock:
+        p = processes.pop(did, None)
+    if p is None:
+        return
+    logger.info(f"⏸️ Pausing live capture on device {did} for history pull")
+    try:
+        p.terminate()
+        p.join(timeout=5)
+    except Exception:
+        pass
+
+
+def _resume_capture_device(processes: Dict[Any, Process], device: dict) -> None:
+    did = device.get("device_id")
+    try:
+        with _processes_lock:
+            processes[did] = spawn_capture_process(device)
+    except Exception as exc:
+        logger.error(f"❌ Failed to resume capture for device {did}: {exc}")
+    finally:
+        with _paused_lock:
+            _paused_device_ids.discard(did)
+
+
+def _pull_one_device_history(
+    device: dict,
+    target_dates: set,
+    processes: Optional[Dict[Any, Process]],
+) -> int:
+    """Download stored punches. Keep live capture if a second session works.
+
+    ZKTeco terminals often allow only one SDK connection. Try the pull while
+    live capture is running; if that fails, pause just this device, retry,
+    then resume. Other devices stay in live capture the whole time.
+    """
+    try:
+        return _eod_one_device(device, target_dates)
+    except Exception as first_exc:
+        if processes is None:
+            raise
+        logger.warning(
+            f"⚠️ [device {device.get('device_id')}] history pull failed "
+            f"while live capture was running ({first_exc}); "
+            f"pausing this device only and retrying"
+        )
+        _pause_capture_device(processes, device)
+        try:
+            time.sleep(3)
+            return _eod_one_device(device, target_dates)
+        finally:
+            time.sleep(3)
+            _resume_capture_device(processes, device)
+
+
 def supervise_processes(processes: Dict[Any, Process]) -> None:
     """Restart any device subprocess that has died."""
     for d in DEVICES:
         did = d.get("device_id")
-        p = processes.get(did)
+        with _paused_lock:
+            if did in _paused_device_ids:
+                continue
+        with _processes_lock:
+            p = processes.get(did)
         if p is None or not p.is_alive():
             if p is not None:
                 exitcode = p.exitcode
@@ -838,7 +943,8 @@ def supervise_processes(processes: Dict[Any, Process]) -> None:
                 except Exception:
                     pass
             try:
-                processes[did] = spawn_capture_process(d)
+                with _processes_lock:
+                    processes[did] = spawn_capture_process(d)
             except Exception as exc:
                 logger.error(
                     f"❌ Failed to spawn capture for device {did}: {exc}"
@@ -848,12 +954,15 @@ def supervise_processes(processes: Dict[Any, Process]) -> None:
 def stop_processes(
     processes: Dict[Any, Process], timeout: int = 5
 ) -> None:
-    for _did, p in list(processes.items()):
+    with _processes_lock:
+        items = list(processes.items())
+        processes.clear()
+    for _did, p in items:
         try:
             p.terminate()
         except Exception:
             pass
-    for _did, p in list(processes.items()):
+    for _did, p in items:
         try:
             p.join(timeout=timeout)
         except Exception:
@@ -864,9 +973,18 @@ def stop_processes(
 # Boot recovery (rate-limited so a crash-loop doesn't thrash the devices)
 # ---------------------------------------------------------------------------
 
-def maybe_run_boot_recovery(force_extended: bool = False) -> None:
+def maybe_run_boot_recovery(
+    force_extended: bool = False,
+    processes: Optional[Dict[Any, Process]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    """Pull ``boot_sync_days`` of device history into the queue on startup.
+
+    Safe to run in a background thread alongside live capture. Per-device
+    pull will pause only the terminal that needs a free SDK session.
+    """
     global _queue_db_needs_extended_recovery
-    lookback = BOOT_RECOVERY_DAYS
+    lookback = BOOT_SYNC_DAYS
     if force_extended or _queue_db_needs_extended_recovery:
         lookback = POST_DB_RESET_RECOVERY_DAYS
         logger.info(
@@ -881,20 +999,26 @@ def maybe_run_boot_recovery(force_extended: bool = False) -> None:
                 last_dt = datetime.fromisoformat(last_recovery)
                 if datetime.now() - last_dt < timedelta(minutes=30):
                     logger.info(
-                        f"⚙️ Skipping boot recovery (last ran {last_recovery})"
+                        f"⚙️ Skipping boot sync (last succeeded {last_recovery})"
                     )
                     return
             except Exception:
                 pass
-        logger.info(
-            f"⚙️ Boot EoD recovery (lookback={lookback}d)"
-        )
+        logger.info(f"⚙️ Boot sync (lookback={lookback}d, background)")
 
+    ok = False
     try:
-        end_of_day_task(lookback_days=lookback)
+        ok = bool(
+            end_of_day_task(
+                lookback_days=lookback,
+                purpose="boot",
+                processes=processes,
+                stop_event=stop_event,
+            )
+        )
     except Exception as exc:
         logger.exception(f"Boot recovery error: {exc}")
-    finally:
+    if ok:
         try:
             queue.set_state(
                 "last_boot_recovery_at",
@@ -902,6 +1026,10 @@ def maybe_run_boot_recovery(force_extended: bool = False) -> None:
             )
         except Exception:
             pass
+    else:
+        logger.warning(
+            "Boot sync did not finish cleanly; next restart will retry"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -956,7 +1084,18 @@ def main() -> None:
     processes: Dict[Any, Process] = {}
     supervise_processes(processes)
 
-    maybe_run_boot_recovery(force_extended=_db_action == "reset")
+    boot_sync = threading.Thread(
+        target=maybe_run_boot_recovery,
+        kwargs={
+            "force_extended": _db_action == "reset",
+            "processes": processes,
+            "stop_event": stop_event,
+        },
+        name="boot-sync",
+        daemon=True,
+    )
+    boot_sync.start()
+    logger.info("🟢 Live capture is running; 60-day boot sync is in background")
 
     last_reconnect = time.time()
     last_watchdog = 0.0
@@ -977,12 +1116,14 @@ def main() -> None:
                     supervise_processes(processes)
                     last_watchdog = now
 
-                if now - last_reconnect >= RECONNECT_INTERVAL_S:
+                if (
+                    now - last_reconnect >= RECONNECT_INTERVAL_S
+                    and not _history_pull_active.is_set()
+                ):
                     logger.info(
                         "🔁 Scheduled reconnect of all device workers"
                     )
                     stop_processes(processes)
-                    processes.clear()
                     supervise_processes(processes)
                     last_reconnect = now
 
@@ -1005,15 +1146,21 @@ def main() -> None:
 
                 # Daily EoD: anywhere in 23:55-23:59, run once per day,
                 # retry every minute within the window if it fails.
+                # Live capture stays up; only a busy device is paused.
                 if (
                     now_dt.hour == 23
                     and 55 <= now_dt.minute <= 59
                     and last_eod_done_marker != today_iso
                     and (now - last_eod_attempt >= 60)
+                    and not _history_pull_active.is_set()
                 ):
                     last_eod_attempt = now
                     try:
-                        if end_of_day_task(lookback_days=EOD_LOOKBACK_DAYS):
+                        if end_of_day_task(
+                            lookback_days=EOD_LOOKBACK_DAYS,
+                            processes=processes,
+                            stop_event=stop_event,
+                        ):
                             last_eod_done_marker = today_iso
                             queue.set_state("last_eod_date", today_iso)
                     except Exception as exc:
