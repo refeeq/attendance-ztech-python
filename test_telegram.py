@@ -124,6 +124,26 @@ def test_telegram_bot():
     else:
         print("   ❌ Error notification failed to send")
     
+    print("   Testing queue cleanup notification...")
+    success = telegram_notifier.send_cleanup_notification_sync(
+        success=True,
+        days=90,
+        deleted=1234,
+        remaining=5600,
+        pending=2,
+        cutoff="2026-06-10 00:00:00",
+        oldest_kept="2026-06-11 07:12:00",
+        bytes_before=40 * 1024 * 1024,
+        bytes_after=8 * 1024 * 1024,
+        duration_s=1.8,
+        vacuumed=True,
+        reason="test",
+    )
+    if success:
+        print("   ✅ Cleanup notification sent successfully")
+    else:
+        print("   ❌ Cleanup notification failed to send")
+
     print("   Testing device status notification...")
     success = telegram_notifier.send_message_sync(
         f"🧪 <b>Test: {telegram_notifier.system_name} - Device Status</b>\n\n"

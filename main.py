@@ -17,7 +17,11 @@ Pipeline
    re-enqueues them idempotently as a safety net for any RT punches missed
    by network glitches. Capture workers are paused for that pull so the
    device is free.
-5. On every daemon start live capture begins immediately. A background
+5. Morning ERP sync (08:00, today only) re-pulls the current day's punches
+   so late-arrival data is on the ERP when staff need it. Runs once per
+   day; if the daemon was down at 08:00 it catch-up runs after it returns.
+   After enqueue it waits for the pusher to drain pending rows.
+6. On every daemon start live capture begins immediately. A background
    thread then pulls ``boot_sync_days`` (default 60) of history into the
    queue; the pusher drains those rows to the ERP without blocking punches.
    The legacy ``boot_sync_30d.py`` oneshot still exists for systemd/cron.
@@ -159,18 +163,45 @@ PUSH_BATCH_SIZE      = max(1,  int(_SYNC_CFG.get("batch_size", 200)))
 PUSH_INTERVAL_S      = max(1,  int(_SYNC_CFG.get("push_interval_s", 15)))
 PUSH_TIMEOUT_S       = max(5,  int(_SYNC_CFG.get("push_timeout_s", 60)))
 PUSH_RETRIES         = max(1,  int(_SYNC_CFG.get("push_retries", 5)))
-PURGE_DAYS           = int(_SYNC_CFG.get("purge_synced_after_days", 0))
+_RAW_PURGE_DAYS      = int(_SYNC_CFG.get("purge_synced_after_days", 90))
+PURGE_INTERVAL_S     = max(300, int(_SYNC_CFG.get("purge_interval_s", 3600)))
+PURGE_VACUUM_MIN_DELETED = max(
+    1, int(_SYNC_CFG.get("purge_vacuum_min_deleted", 100))
+)
 # Telegram "data push OK" during backlog drain: at most one message per interval
 # so large queue drain does not hit Telegram 429.
 TG_DATA_PUSH_PROGRESS_INTERVAL_S = 300
 WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
 RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
+MORNING_SYNC_HOUR = max(0, min(23, int(_SYNC_CFG.get("morning_sync_hour", 8))))
+MORNING_SYNC_MINUTE = max(
+    0, min(59, int(_SYNC_CFG.get("morning_sync_minute", 0)))
+)
+MORNING_SYNC_WINDOW_MIN = max(
+    1, int(_SYNC_CFG.get("morning_sync_window_min", 5))
+)
+MORNING_SYNC_DRAIN_TIMEOUT_S = max(
+    30, int(_SYNC_CFG.get("morning_sync_drain_timeout_s", 300))
+)
 BOOT_RECOVERY_DAYS   = max(1,  int(_SYNC_CFG.get("boot_recovery_days", 3)))
 BOOT_SYNC_DAYS       = max(
     BOOT_RECOVERY_DAYS,
     int(_SYNC_CFG.get("boot_sync_days", 60)),
 )
+# Never retain less than the boot-sync window or a restart would re-enqueue
+# (and re-push) punches we just deleted.
+if _RAW_PURGE_DAYS > 0 and _RAW_PURGE_DAYS < BOOT_SYNC_DAYS:
+    logger.warning(
+        "purge_synced_after_days (%s) is shorter than boot_sync_days (%s); "
+        "raising retention to %sd so boot sync cannot re-push deleted rows",
+        _RAW_PURGE_DAYS,
+        BOOT_SYNC_DAYS,
+        BOOT_SYNC_DAYS,
+    )
+    PURGE_DAYS = BOOT_SYNC_DAYS
+else:
+    PURGE_DAYS = _RAW_PURGE_DAYS
 POST_DB_RESET_RECOVERY_DAYS = max(
     BOOT_SYNC_DAYS,
     int(_SYNC_CFG.get("post_db_reset_recovery_days", 60)),
@@ -200,13 +231,14 @@ telegram_notifier = TelegramNotifier(
 )
 
 _retention = (
-    "forever" if PURGE_DAYS <= 0 else f"{PURGE_DAYS}d after sync"
+    "forever" if PURGE_DAYS <= 0 else f"{PURGE_DAYS}d (punch timestamp)"
 )
 logger.info(
     f"Config: devices={len(DEVICES)} endpoint={ENDPOINT} "
     f"batch_size={PUSH_BATCH_SIZE} push_interval_s={PUSH_INTERVAL_S} "
     f"reconnect_interval_s={RECONNECT_INTERVAL_S} db={DB_PATH} "
     f"boot_sync_days={BOOT_SYNC_DAYS} eod_lookback_days={EOD_LOOKBACK_DAYS} "
+    f"morning_sync={MORNING_SYNC_HOUR:02d}:{MORNING_SYNC_MINUTE:02d} "
     f"retention={_retention} "
     f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
 )
@@ -234,6 +266,12 @@ def tg_send(
     (per-batch push, per-watchdog respawn) cannot spam the chat.
     """
     if not telegram_notifier.enabled:
+        return
+    notif_key = {
+        "morning_sync_start": "morning_sync",
+        "morning_sync_done": "morning_sync",
+    }.get(kind)
+    if notif_key and not telegram_notifier.is_notification_enabled(notif_key):
         return
     if min_interval_s > 0:
         with _tg_lock:
@@ -405,6 +443,102 @@ def _repair_queue_if_corrupt(context: str) -> bool:
     return True
 
 
+def _notify_cleanup(
+    result: Optional[Dict[str, Any]],
+    *,
+    error: Optional[str],
+    reason: str,
+) -> None:
+    success = error is None
+    if success and not telegram_notifier.is_notification_enabled("cleanup"):
+        return
+    if not success and not (
+        telegram_notifier.is_notification_enabled("cleanup")
+        or telegram_notifier.is_notification_enabled("errors")
+    ):
+        return
+    payload = result or {}
+    message = telegram_notifier.cleanup_message_html(
+        success=success,
+        days=int(payload.get("days") or PURGE_DAYS),
+        deleted=int(payload.get("deleted") or 0),
+        remaining=int(payload.get("remaining") or 0),
+        pending=int(payload.get("pending") or 0),
+        cutoff=str(payload.get("cutoff") or ""),
+        oldest_kept=str(payload.get("oldest_kept") or ""),
+        bytes_before=int(payload.get("bytes_before") or 0),
+        bytes_after=int(payload.get("bytes_after") or 0),
+        duration_s=float(payload.get("duration_s") or 0.0),
+        vacuumed=bool(payload.get("vacuumed")),
+        reason=reason,
+        error=error,
+    )
+    tg_send(
+        message,
+        kind="cleanup_error" if error else f"cleanup_{reason}",
+        min_interval_s=0 if (reason == "startup" or error) else 3600,
+    )
+
+
+def run_retention_cleanup(
+    *, reason: str, force_vacuum: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Drop synced local punches older than ``PURGE_DAYS`` and alert."""
+    if PURGE_DAYS <= 0:
+        return None
+    try:
+        result = queue.purge_synced_older_than(PURGE_DAYS, vacuum=False)
+        deleted = int(result.get("deleted") or 0)
+        should_vacuum = deleted > 0 and (
+            force_vacuum or deleted >= PURGE_VACUUM_MIN_DELETED
+        )
+        if should_vacuum:
+            try:
+                checkpoint_wal(DB_PATH)
+                queue.vacuum()
+                result["vacuumed"] = True
+                result["bytes_after"] = queue.db_size_bytes()
+            except Exception as exc:
+                logger.warning("VACUUM after purge failed: %s", exc)
+        if deleted:
+            logger.info(
+                "🧽 Purged %s synced records older than %sd "
+                "(remaining=%s pending=%s vacuumed=%s %.1fs) [%s]",
+                f"{deleted:,}",
+                PURGE_DAYS,
+                result.get("remaining"),
+                result.get("pending"),
+                result.get("vacuumed"),
+                result.get("duration_s"),
+                reason,
+            )
+        else:
+            logger.info(
+                "🧽 Cleanup (%s): no synced punches older than %sd "
+                "(remaining=%s)",
+                reason,
+                PURGE_DAYS,
+                result.get("remaining"),
+            )
+        try:
+            queue.set_state(
+                "last_purge_at",
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            queue.set_state("last_purge_deleted", deleted)
+        except Exception:
+            pass
+        if deleted or reason == "startup" or result.get("vacuumed"):
+            _notify_cleanup(result, error=None, reason=reason)
+        return result
+    except Exception as exc:
+        logger.warning("Purge error (%s): %s", reason, exc)
+        if is_sqlite_corruption_error(exc):
+            _repair_queue_if_corrupt(f"retention purge ({reason})")
+        _notify_cleanup(None, error=str(exc)[:500], reason=reason)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Device helpers
 # ---------------------------------------------------------------------------
@@ -484,7 +618,7 @@ def pusher_loop(stop_event: threading.Event) -> None:
     """Drain the queue to the ERP. Runs as a daemon thread in main process."""
     logger.info("📤 Pusher thread started")
     last_push_attempt = 0.0
-    last_purge = 0.0
+    last_purge = time.time()  # startup already purged; wait one interval
     consecutive_failures = 0
 
     while not stop_event.is_set():
@@ -500,20 +634,11 @@ def pusher_loop(stop_event: threading.Event) -> None:
                 stop_event.wait(timeout=5)
                 continue
 
+            if PURGE_DAYS > 0 and now - last_purge >= PURGE_INTERVAL_S:
+                run_retention_cleanup(reason="hourly", force_vacuum=False)
+                last_purge = now
+
             if pending == 0:
-                if PURGE_DAYS > 0 and now - last_purge >= 3600:
-                    try:
-                        deleted = queue.purge_synced_older_than(PURGE_DAYS)
-                        if deleted:
-                            logger.info(
-                                f"🧽 Purged {deleted} synced records "
-                                f"older than {PURGE_DAYS}d"
-                            )
-                    except Exception as exc:
-                        logger.warning(f"Purge error: {exc}")
-                        if is_sqlite_corruption_error(exc):
-                            _repair_queue_if_corrupt("pusher purge")
-                    last_purge = now
                 stop_event.wait(timeout=1.0)
                 continue
 
@@ -765,6 +890,41 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
     return new_count
 
 
+def wait_for_queue_drain(
+    timeout_s: int,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[bool, int]:
+    """Poll until the pusher has no pending rows, or ``timeout_s`` elapses.
+
+    Does not POST to the ERP itself — ``pusher_loop`` owns HTTP. Returns
+    ``(drained, remaining)`` where ``remaining`` is the last unsynced count
+    (``-1`` if the count could not be read).
+    """
+    deadline = time.time() + max(1, int(timeout_s))
+    remaining = -1
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            remaining = queue.count_unsynced()
+        except Exception as exc:
+            logger.warning(f"Drain wait: count_unsynced failed: {exc}")
+            remaining = -1
+            break
+        if remaining == 0:
+            return True, 0
+        if stop_event is not None:
+            stop_event.wait(timeout=1.0)
+        else:
+            time.sleep(1.0)
+    if remaining < 0:
+        try:
+            remaining = queue.count_unsynced()
+        except Exception:
+            remaining = -1
+    return False, remaining
+
+
 def end_of_day_task(
     lookback_days: Optional[int] = None,
     *,
@@ -772,16 +932,31 @@ def end_of_day_task(
     processes: Optional[Dict[Any, Process]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> bool:
-    lookback = max(1, int(lookback_days or EOD_LOOKBACK_DAYS))
+    is_boot = purpose == "boot"
+    is_morning = purpose == "morning"
+    if is_morning:
+        lookback = 1
+    else:
+        lookback = max(1, int(lookback_days or EOD_LOOKBACK_DAYS))
     today = date.today()
     target_dates = {
         (today - timedelta(days=i)).isoformat() for i in range(lookback)
     }
-    is_boot = purpose == "boot"
-    label = f"{lookback}-Day Boot Sync" if is_boot else "End-of-Day"
-    emoji = "🚀" if is_boot else "🧹"
-    kind_start = "boot_sync_start" if is_boot else "eod_start"
-    kind_done = "boot_sync_done" if is_boot else "eod_done"
+    if is_boot:
+        label = f"{lookback}-Day Boot Sync"
+        emoji = "🚀"
+        kind_start = "boot_sync_start"
+        kind_done = "boot_sync_done"
+    elif is_morning:
+        label = "Morning ERP Sync"
+        emoji = "🌅"
+        kind_start = "morning_sync_start"
+        kind_done = "morning_sync_done"
+    else:
+        label = "End-of-Day"
+        emoji = "🧹"
+        kind_start = "eod_start"
+        kind_done = "eod_done"
 
     logger.info(
         f"{emoji} {label} start (lookback={lookback}d, "
@@ -823,13 +998,36 @@ def end_of_day_task(
         if not already_pulling:
             _history_pull_active.clear()
 
+    drain_line = "📤 Pending rows are pushing to ERP in the background."
+    if is_morning and fail == 0:
+        logger.info(
+            f"{emoji} {label} waiting up to "
+            f"{MORNING_SYNC_DRAIN_TIMEOUT_S}s for ERP drain"
+        )
+        drained, remaining = wait_for_queue_drain(
+            MORNING_SYNC_DRAIN_TIMEOUT_S, stop_event
+        )
+        if drained:
+            drain_line = "📤 Queue drained — today's punches are on the ERP."
+            logger.info(f"{emoji} {label} ERP drain complete")
+        else:
+            drain_line = (
+                f"⚠️ Drain still pending after "
+                f"{MORNING_SYNC_DRAIN_TIMEOUT_S}s "
+                f"({remaining} unsynced). Pusher will keep retrying."
+            )
+            logger.warning(
+                f"{emoji} {label} ERP drain timed out "
+                f"(remaining={remaining}); pusher continues"
+            )
+
     tg_send(
         f"{emoji} <b>{label} Complete</b>\n"
         f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
         f"✅ OK devices: {ok}\n"
         f"❌ Failed devices: {fail}\n"
         f"🧾 New records enqueued: {total_new}\n"
-        f"📤 Pending rows are pushing to ERP in the background.",
+        f"{drain_line}",
         kind=kind_done,
         min_interval_s=60,
     )
@@ -1050,17 +1248,38 @@ def main() -> None:
     else:
         logger.info("✅ At least one device reachable")
 
+    cleanup = None
+    if PURGE_DAYS > 0:
+        logger.info(
+            "🧽 Startup retention cleanup (keep last %sd, vacuum after)...",
+            PURGE_DAYS,
+        )
+        cleanup = run_retention_cleanup(reason="startup", force_vacuum=True)
+    else:
+        logger.info("🧽 Local retention disabled (purge_synced_after_days=0)")
+
     try:
         pending_at_boot = queue.count_unsynced()
     except Exception:
         pending_at_boot = -1
+
+    if PURGE_DAYS > 0:
+        retain_line = f"🧽 Retention: last {PURGE_DAYS}d"
+        if cleanup:
+            retain_line += (
+                f" · removed {int(cleanup.get('deleted') or 0):,}"
+                f" · left {int(cleanup.get('remaining') or 0):,}"
+            )
+    else:
+        retain_line = "🧽 Retention: keep forever"
 
     tg_send(
         f"🚀 <b>Attendance ZTech Started</b>\n"
         f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
         f"🖥️ Devices: {len(DEVICES)}\n"
         f"🌐 Endpoint: {ENDPOINT}\n"
-        f"📦 Pending records: {pending_at_boot}",
+        f"📦 Pending records: {pending_at_boot}\n"
+        f"{retain_line}",
         kind="boot",
     )
 
@@ -1100,9 +1319,13 @@ def main() -> None:
     last_reconnect = time.time()
     last_watchdog = 0.0
     last_eod_attempt = 0.0
+    last_morning_attempt = 0.0
     last_wal_checkpoint = time.time()
     last_integrity_check = time.time()
     last_eod_done_marker: Optional[str] = queue.get_state("last_eod_date")
+    last_morning_done_marker: Optional[str] = queue.get_state(
+        "last_morning_sync_date"
+    )
 
     try:
         logger.info("⏰ Entering main loop")
@@ -1143,6 +1366,54 @@ def main() -> None:
                         _repair_queue_if_corrupt(
                             f"scheduled integrity check: {db_msg}"
                         )
+
+                # Daily morning ERP sync: from 08:00 (configurable), run
+                # once per day. The first 5 minutes are the primary window
+                # (retry every 60s). After that a catch-up still fires if
+                # the daemon was down at 08:00, retried every 15 minutes
+                # so a dead device does not get hammered all day.
+                morning_start = now_dt.replace(
+                    hour=MORNING_SYNC_HOUR,
+                    minute=MORNING_SYNC_MINUTE,
+                    second=0,
+                    microsecond=0,
+                )
+                morning_window_end = morning_start + timedelta(
+                    minutes=MORNING_SYNC_WINDOW_MIN
+                )
+                morning_in_window = (
+                    morning_start <= now_dt < morning_window_end
+                )
+                morning_retry_s = 60 if morning_in_window else 900
+                morning_due = (
+                    last_morning_done_marker != today_iso
+                    and now_dt >= morning_start
+                    and (now - last_morning_attempt >= morning_retry_s)
+                    and not _history_pull_active.is_set()
+                )
+                if morning_due:
+                    last_morning_attempt = now
+                    if morning_in_window:
+                        logger.info("🌅 Morning ERP sync window")
+                    else:
+                        logger.info(
+                            "🌅 Morning ERP sync catch-up "
+                            f"(missed the {MORNING_SYNC_HOUR:02d}:"
+                            f"{MORNING_SYNC_MINUTE:02d} window)"
+                        )
+                    try:
+                        if end_of_day_task(
+                            lookback_days=1,
+                            purpose="morning",
+                            processes=processes,
+                            stop_event=stop_event,
+                        ):
+                            last_morning_done_marker = today_iso
+                            queue.set_state(
+                                "last_morning_sync_date", today_iso
+                            )
+                    except Exception as exc:
+                        logger.exception(f"Morning sync error: {exc}")
 
                 # Daily EoD: anywhere in 23:55-23:59, run once per day,
                 # retry every minute within the window if it fails.

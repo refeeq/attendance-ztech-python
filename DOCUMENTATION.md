@@ -62,7 +62,8 @@ Every second, the main loop checks three things:
 | Check | What happens | How often |
 |---|---|---|
 | **Reconnect timer** | Kills all device processes and restarts them (fresh connections) | Every **15 minutes** |
-| **End-of-Day timer** | Fetches ALL of today's logs from each device and pushes them | Once a day at **23:59** |
+| **Morning ERP sync** | Re-pulls **today's** punches, enqueues misses, waits for the pusher to drain to the ERP | Once a day from **08:00** (catch-up later if the daemon was down) |
+| **End-of-Day timer** | Fetches ALL of today's logs from each device and enqueues them | Once a day at **23:55–23:59** |
 | **Buffer overflow** | If the buffer has ≥ `buffer_limit` records, push them to the server | Whenever the buffer fills up |
 
 ### 🛑 Shutdown
@@ -120,9 +121,11 @@ This is the **single most important file** you'll edit. Here's what every field 
     "notifications": {
       "startup": true,
       "end_of_day": true,
+      "morning_sync": true,
       "data_push": true,
       "errors": true,
-      "device_status": true
+      "device_status": true,
+      "cleanup": true
     }
   }
 }
@@ -360,14 +363,17 @@ Once deployed, the system runs 24/7 without intervention. Here is its daily time
 │         ↕ Buffer fills → push to server                         │
 │         ↕ Every 60 sec: periodic flush (if buffer has data)     │
 │                                                                 │
-│  08:00  Employees start arriving, punches increase              │
-│         → Each punch logged and pushed within seconds           │
+│  08:00  MORNING ERP SYNC                                        │
+│         → Re-pull today's punches from every device             │
+│         → Enqueue only records not already in the queue         │
+│         → Wait for the pusher to drain to the ERP               │
+│         → Staff can see who is late on the ERP                  │
 │                                                                 │
 │  17:00  Employees leave, punches spike again                    │
 │                                                                 │
-│  23:59  END-OF-DAY TASK TRIGGERS                                │
+│  23:55  END-OF-DAY TASK TRIGGERS                                │
 │         → System fetches ALL of today's logs from each device   │
-│         → Pushes everything to the server (catches any misses)  │
+│         → Enqueues anything missed (pusher drains to ERP)       │
 │         → Sends Telegram summary                                │
 │                                                                 │
 │  00:00  New day begins, cycle repeats                           │
@@ -379,9 +385,13 @@ Once deployed, the system runs 24/7 without intervention. Here is its daily time
 
 ZKTeco devices sometimes drop connections silently. By reconnecting every 15 minutes, the system ensures that a dropped connection doesn't go unnoticed for long. It kills the old device processes and starts fresh ones.
 
+### Why the Morning ERP sync?
+
+Staff need today's check-ins on the ERP at 08:00 so they can see who is late. Live capture already pushes punches as they happen, but a dropped device session or a failed HTTP batch can leave gaps. The morning job re-pulls **today only** from every device, enqueues anything missing, and waits for the existing pusher to drain the queue. It runs once per day (`last_morning_sync_date`). If the daemon was down at 08:00, it catch-up runs after it returns.
+
 ### Why the End-of-Day task?
 
-Real-time capture is great, but network hiccups can cause some punches to be missed. The End-of-Day (EoD) task at 23:59 reads **all** of today's logs directly from the device memory, guaranteeing that nothing is lost. Your server API should handle duplicates gracefully (idempotent).
+Real-time capture is great, but network hiccups can cause some punches to be missed. The End-of-Day (EoD) task at 23:55–23:59 reads **all** of today's logs directly from the device memory, guaranteeing that nothing is lost. Your server API should handle duplicates gracefully (idempotent).
 
 ### What is the buffer?
 
@@ -400,7 +410,9 @@ The system sends real-time Telegram messages for important events. Here are the 
 | System Error | ❌ | When an unexpected error occurs in the main loop |
 | Data Push Success | ✅ | Every time records are successfully pushed to the server |
 | Data Push Failed | ❌ | When an API push fails (HTTP error or network issue) |
-| End-of-Day Started | 🧹 | When the 23:59 EoD task begins |
+| Morning ERP Sync Started | 🌅 | When the 08:00 today-only completeness pass begins |
+| Morning ERP Sync Complete | 🌅 | When the morning pull finishes (and drain wait ends) |
+| End-of-Day Started | 🧹 | When the 23:55 EoD task begins |
 | End-of-Day Complete | 🧹 | When the EoD task finishes (summary of OK/Failed devices) |
 | 30-Day Boot Sync Started | 🚀 | When `boot_sync_30d.py` starts |
 | 30-Day Boot Sync Complete | ✅ | When the boot sync finishes |
@@ -414,6 +426,7 @@ In `config.json`, you can turn individual notification types on/off:
 "notifications": {
   "startup": true,       // 🚀 System start messages
   "end_of_day": true,    // 🧹 EoD messages
+  "morning_sync": true,  // 🌅 08:00 ERP completeness pass
   "data_push": true,     // ✅/❌ Push success/failure
   "errors": true,        // ❌ Error alerts
   "device_status": true  // 📱 Device connection status
@@ -472,6 +485,7 @@ The system writes to **four** log destinations simultaneously:
 | 🕘 | New attendance punch recorded |
 | 📤 | Pushing data to server |
 | ⏱️ | Periodic flush |
+| 🌅 | Morning ERP sync (08:00) |
 | 🧹 | End-of-Day task |
 | 📊 | Data statistics |
 | ℹ️ | Informational |
@@ -750,7 +764,8 @@ sudo journalctl -u attendance-ztech --no-pager | tail -50
 │  │  ┌─────────────────────────────────────────────────────────┐  │  │
 │  │  │ Main Loop (every 1s):                                   │  │  │
 │  │  │   • 15-min reconnect check                              │  │  │
-│  │  │   • 23:59 End-of-Day check                              │  │  │
+│  │  │   • 08:00 Morning ERP sync (today only)                 │  │  │
+│  │  │   • 23:55–23:59 End-of-Day check                        │  │  │
 │  │  │   • Buffer overflow check                               │  │  │
 │  │  └─────────────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────────┘  │
@@ -789,7 +804,7 @@ sudo journalctl -u attendance-ztech --no-pager | tail -50
 
 ### Q: What happens if the internet goes down?
 
-**A:** The system keeps capturing attendance data into the shared buffer. When the internet comes back, the buffer is pushed to the server on the next flush cycle. The End-of-Day task at 23:59 will also catch any missed records.
+**A:** The system keeps capturing attendance data into the durable SQLite queue. When the internet comes back, the pusher drains pending rows to the ERP. The 08:00 morning sync and the End-of-Day task at 23:55–23:59 also re-pull missed records from device memory.
 
 ### Q: What happens if a ZKTeco device goes offline?
 
@@ -893,10 +908,14 @@ All optional. Defaults shown. Existing configs work unchanged.
     "push_interval_s": 15,
     "push_timeout_s": 60,
     "push_retries": 5,
-    "purge_synced_after_days": 0,
+    "purge_synced_after_days": 90,
     "watchdog_interval_s": 30,
     "reconnect_interval_min": 15,
     "eod_lookback_days": 1,
+    "morning_sync_hour": 8,
+    "morning_sync_minute": 0,
+    "morning_sync_window_min": 5,
+    "morning_sync_drain_timeout_s": 300,
     "boot_recovery_days": 3,
     "boot_sync_days": 60
   }
@@ -910,10 +929,14 @@ All optional. Defaults shown. Existing configs work unchanged.
 | `push_interval_s` | How often the pusher polls the queue. |
 | `push_timeout_s` | HTTP timeout per push. |
 | `push_retries` | Retries per push attempt before backing off. |
-| `purge_synced_after_days` | `0` (default) keeps every synced row forever — the durable queue becomes a permanent attendance archive. Set to a positive integer (e.g. `365`) only if you want synced rows automatically deleted after that many days. |
+| `purge_synced_after_days` | Keep only this many days of **synced** local punches (default **90**). Age is the punch timestamp. `0` disables cleanup. Raised automatically if shorter than `boot_sync_days`. Telegram `cleanup` alerts report what was removed. |
 | `watchdog_interval_s` | Cadence of the device-process health check. |
 | `reconnect_interval_min` | Periodic full reconnect cycle (safety net). |
 | `eod_lookback_days` | Daily EoD pulls today + this many prior days (idempotent). |
+| `morning_sync_hour` | Local hour for the 08:00 today-only ERP completeness pass. |
+| `morning_sync_minute` | Local minute (default `0`). |
+| `morning_sync_window_min` | Primary retry window after the start time (default `5`). Catch-up still runs later if the day is unmarked. |
+| `morning_sync_drain_timeout_s` | Seconds to wait for the pusher to empty the queue after the morning pull (default `300`). |
 | `boot_recovery_days` | At daemon start, run a short EoD pull over this many days. |
 | `boot_sync_days` | Used by `boot_sync_30d.py`; window of historical backfill. |
 

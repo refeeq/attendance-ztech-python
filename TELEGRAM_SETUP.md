@@ -6,10 +6,12 @@ This document explains how to set up and use the Telegram bot integration for th
 
 The Telegram bot integration provides real-time notifications about:
 - System startup and shutdown
+- 08:00 morning ERP completeness pass (today's punches)
 - 24-hour end-of-day data pushing process
 - Real-time data pushes when buffer limit is reached
 - Device connection status
 - Error notifications
+- Local queue cleanup (90-day retention)
 - Daily summary reports
 
 ## Setup Instructions
@@ -53,9 +55,11 @@ Edit your `config.json` file and update the Telegram section:
     "notifications": {
       "startup": true,
       "end_of_day": true,
+      "morning_sync": true,
       "data_push": true,
       "errors": true,
-      "device_status": true
+      "device_status": true,
+      "cleanup": true
     }
   }
 }
@@ -88,12 +92,18 @@ This will send test notifications to your Telegram chat to confirm the setup is 
 
 ### Data Push Notifications
 - **Real-time Push**: Sent when buffer limit is reached and data is pushed to server
+- **Morning ERP Sync**: Sent at 08:00 when today's punches are re-pulled and drained to the ERP
 - **End-of-Day Push**: Sent during the 24-hour data collection process
 - **Push Success/Failure**: Detailed status of each data push operation
 
 ### Device Status Notifications
 - **Connection Status**: When devices connect or disconnect
 - **Device Errors**: When specific device errors occur
+
+### Queue Cleanup
+- **Startup cleanup**: How many synced punches older than the retention window were removed, remaining rows, and disk size before/after VACUUM
+- **Hourly cleanup**: Sent when the hourly pass actually deleted rows
+- **Cleanup failure**: Sent if the delete/VACUUM fails (also honors the `errors` flag)
 
 ### Daily Summary
 - **End-of-Day Summary**: Complete summary of the day's operations
@@ -107,9 +117,11 @@ You can customize which notifications you receive by modifying the `notification
 "notifications": {
   "startup": true,        // System startup notifications
   "end_of_day": true,     // 24-hour data push notifications
+  "morning_sync": true,   // 08:00 today-only ERP completeness pass
   "data_push": true,      // Real-time data push notifications
   "errors": true,         // Error notifications
-  "device_status": true   // Device connection status
+  "device_status": true,  // Device connection status
+  "cleanup": true         // Local 90-day queue cleanup
 }
 ```
 

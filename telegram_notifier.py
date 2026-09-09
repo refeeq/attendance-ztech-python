@@ -10,6 +10,17 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 
+def _format_bytes(n: int) -> str:
+    n = max(0, int(n or 0))
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 ** 3:
+        return f"{n / (1024 ** 2):.1f} MB"
+    return f"{n / (1024 ** 3):.2f} GB"
+
+
 def _format_punch_details_lines(
     records: List[Dict[str, Any]], max_lines: int = 20
 ) -> str:
@@ -45,6 +56,9 @@ def apply_telegram_env_overrides(telegram_cfg: Optional[Dict[str, Any]]) -> Dict
 class TelegramNotifier:
     """
     Telegram bot notifier for attendance system status updates.
+
+    Known ``notification_settings`` keys: startup, end_of_day, morning_sync,
+    data_push, errors, device_status, cleanup. Missing keys default to on.
     """
 
     def __init__(
@@ -192,6 +206,116 @@ class TelegramNotifier:
             f"{err_block}"
             f"{details_block}"
         ).strip()
+
+    def cleanup_message_html(
+        self,
+        *,
+        success: bool,
+        days: int,
+        deleted: int = 0,
+        remaining: int = 0,
+        pending: int = 0,
+        cutoff: str = "",
+        oldest_kept: str = "",
+        bytes_before: int = 0,
+        bytes_after: int = 0,
+        duration_s: float = 0.0,
+        vacuumed: bool = False,
+        reason: str = "",
+        error: Optional[str] = None,
+    ) -> str:
+        """Build HTML for a local-queue retention cleanup result."""
+        when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not success:
+            err = html.escape(str(error or "unknown error")[:600])
+            why = f" ({html.escape(reason)})" if reason else ""
+            return (
+                f"❌ <b>{self.system_name} - Queue Cleanup Failed</b>\n\n"
+                f"⌚ <b>Time:</b> {when}\n"
+                f"📅 <b>Retention:</b> {days} days{why}\n"
+                f"🔧 <b>Error:</b> <code>{err}</code>"
+            )
+
+        header = (
+            "🧽 <b>{name} - Queue Cleanup</b>".format(name=self.system_name)
+            if deleted
+            else "🧽 <b>{name} - Queue Cleanup (nothing to remove)</b>".format(
+                name=self.system_name
+            )
+        )
+        size_line = ""
+        if bytes_before or bytes_after:
+            before = _format_bytes(bytes_before)
+            after = _format_bytes(bytes_after)
+            if bytes_before != bytes_after:
+                size_line = f"\n💾 <b>Queue size:</b> {before} → {after}"
+            else:
+                size_line = f"\n💾 <b>Queue size:</b> {after}"
+        extra = ""
+        if cutoff:
+            extra += f"\n📆 <b>Cutoff:</b> {html.escape(cutoff)}"
+        if oldest_kept:
+            extra += f"\n🕰️ <b>Oldest kept punch:</b> {html.escape(oldest_kept)}"
+        if vacuumed:
+            extra += "\n📦 <b>VACUUM:</b> disk space reclaimed"
+        if reason:
+            extra += f"\n🏷️ <b>Trigger:</b> {html.escape(reason)}"
+        return (
+            f"{header}\n\n"
+            f"⌚ <b>Time:</b> {when}\n"
+            f"📅 <b>Retention:</b> last {days} days\n"
+            f"🗑️ <b>Removed:</b> {deleted:,} synced punches\n"
+            f"📦 <b>Remaining:</b> {remaining:,} "
+            f"(pending {pending:,})"
+            f"{size_line}"
+            f"{extra}\n"
+            f"⏱️ <b>Duration:</b> {duration_s:.1f}s\n"
+            "✅ Unsynced rows were kept."
+        ).strip()
+
+    def send_cleanup_notification_sync(
+        self,
+        *,
+        success: bool,
+        days: int,
+        deleted: int = 0,
+        remaining: int = 0,
+        pending: int = 0,
+        cutoff: str = "",
+        oldest_kept: str = "",
+        bytes_before: int = 0,
+        bytes_after: int = 0,
+        duration_s: float = 0.0,
+        vacuumed: bool = False,
+        reason: str = "",
+        error: Optional[str] = None,
+    ) -> bool:
+        """Notify local-queue retention cleanup. Failures also honor ``errors``."""
+        if success:
+            if not self.is_notification_enabled("cleanup"):
+                return False
+        elif not (
+            self.is_notification_enabled("cleanup")
+            or self.is_notification_enabled("errors")
+        ):
+            return False
+
+        message = self.cleanup_message_html(
+            success=success,
+            days=days,
+            deleted=deleted,
+            remaining=remaining,
+            pending=pending,
+            cutoff=cutoff,
+            oldest_kept=oldest_kept or "",
+            bytes_before=bytes_before,
+            bytes_after=bytes_after,
+            duration_s=duration_s,
+            vacuumed=vacuumed,
+            reason=reason,
+            error=error,
+        )
+        return self.send_message_sync(message)
 
     def send_data_push_notification_sync(
         self,

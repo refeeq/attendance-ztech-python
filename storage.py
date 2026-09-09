@@ -19,7 +19,8 @@ This module gives the project a single, durable source of truth:
 * SQLite WAL mode allows the device subprocesses, the pusher thread, and
   ad-hoc CLI scripts (``sync_all.py``, ``boot_sync_30d.py``) to share the
   same queue safely across processes.
-* A small ``sync_state`` table holds run-to-run state (e.g. last EoD date)
+* A small ``sync_state`` table holds run-to-run state (e.g. last EoD date,
+  last morning ERP sync date)
   so daily safety-net behavior survives restarts.
 """
 
@@ -326,6 +327,9 @@ CREATE INDEX IF NOT EXISTS idx_aq_unsynced
 CREATE INDEX IF NOT EXISTS idx_aq_synced_created
     ON attendance_queue(synced, created_at);
 
+CREATE INDEX IF NOT EXISTS idx_aq_synced_timestamp
+    ON attendance_queue(synced, timestamp);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -409,9 +413,7 @@ class AttendanceQueue:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE;")
             try:
-                before = conn.execute(
-                    "SELECT COUNT(*) FROM attendance_queue;"
-                ).fetchone()[0]
+                before = conn.total_changes
                 conn.executemany(
                     """
                     INSERT OR IGNORE INTO attendance_queue
@@ -420,11 +422,9 @@ class AttendanceQueue:
                     """,
                     rows,
                 )
-                after = conn.execute(
-                    "SELECT COUNT(*) FROM attendance_queue;"
-                ).fetchone()[0]
+                inserted = conn.total_changes - before
                 conn.execute("COMMIT;")
-                return max(0, int(after) - int(before))
+                return max(0, int(inserted))
             except Exception:
                 try:
                     conn.execute("ROLLBACK;")
@@ -522,36 +522,113 @@ class AttendanceQueue:
                     pass
                 raise
 
-    # ----------------------------------------------------------------- maintain
-    def purge_synced_older_than(self, days: int = 0) -> int:
-        """Delete synced records older than ``days`` days.
+    def db_size_bytes(self) -> int:
+        """Main DB file plus WAL/SHM, in bytes."""
+        total = 0
+        for path in _db_related_files(self.db_path):
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+        return total
 
-        Pass ``days <= 0`` to **disable** purging entirely. The durable queue
-        is then a permanent historical record of every attendance event the
-        system has ever seen, which is the project's default behaviour.
+    def vacuum(self) -> None:
+        """Rewrite the DB to reclaim space after a large delete."""
+        with self._conn() as conn:
+            conn.execute("VACUUM;")
+
+    def oldest_punch_timestamp(self) -> Optional[str]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MIN(timestamp) AS oldest FROM attendance_queue;"
+            ).fetchone()
+        return row["oldest"] if row and row["oldest"] else None
+
+    # ----------------------------------------------------------------- maintain
+    def purge_synced_older_than(
+        self, days: int = 0, *, vacuum: bool = False
+    ) -> Dict[str, Any]:
+        """Delete synced punches older than ``days`` days.
+
+        Age is the punch ``timestamp`` (the attendance event). ``created_at``
+        is used only when ``timestamp`` is empty. Unsynced rows are never
+        deleted.
+
+        Pass ``days <= 0`` to disable purging. Set ``vacuum=True`` after a
+        large delete so the file on disk shrinks (exclusive lock; callers
+        should do this at startup or when the queue is quiet).
         """
+        started = time.monotonic()
         days = int(days)
+        empty: Dict[str, Any] = {
+            "deleted": 0,
+            "days": days,
+            "cutoff": "",
+            "remaining": 0,
+            "pending": 0,
+            "vacuumed": False,
+            "bytes_before": self.db_size_bytes(),
+            "bytes_after": 0,
+            "duration_s": 0.0,
+            "oldest_kept": None,
+        }
         if days <= 0:
-            return 0
+            stats = self.stats()
+            empty["remaining"] = stats["total"]
+            empty["pending"] = stats["pending"]
+            empty["oldest_kept"] = self.oldest_punch_timestamp()
+            empty["bytes_after"] = empty["bytes_before"]
+            empty["duration_s"] = round(time.monotonic() - started, 3)
+            return empty
+
         cutoff = (datetime.utcnow() - timedelta(days=days)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        empty["cutoff"] = cutoff
+        bytes_before = empty["bytes_before"]
+
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE;")
             try:
                 cur = conn.execute(
-                    "DELETE FROM attendance_queue "
-                    "WHERE synced = 1 AND created_at < ?;",
+                    """
+                    DELETE FROM attendance_queue
+                     WHERE synced = 1
+                       AND COALESCE(NULLIF(timestamp, ''), created_at) < ?;
+                    """,
                     (cutoff,),
                 )
+                deleted = int(cur.rowcount or 0)
                 conn.execute("COMMIT;")
-                return int(cur.rowcount or 0)
             except Exception:
                 try:
                     conn.execute("ROLLBACK;")
                 except Exception:
                     pass
                 raise
+
+        vacuumed = False
+        if vacuum and deleted > 0:
+            try:
+                checkpoint_wal(self.db_path)
+                self.vacuum()
+                vacuumed = True
+            except Exception:
+                logger.warning("VACUUM after purge failed", exc_info=True)
+
+        stats = self.stats()
+        return {
+            "deleted": deleted,
+            "days": days,
+            "cutoff": cutoff,
+            "remaining": stats["total"],
+            "pending": stats["pending"],
+            "vacuumed": vacuumed,
+            "bytes_before": bytes_before,
+            "bytes_after": self.db_size_bytes(),
+            "duration_s": round(time.monotonic() - started, 3),
+            "oldest_kept": self.oldest_punch_timestamp(),
+        }
 
     def stats(self) -> Dict[str, int]:
         with self._conn() as conn:

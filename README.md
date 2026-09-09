@@ -16,7 +16,7 @@ built the way it is, and how to operate it on a school server.
 2. [The Big Picture in One Diagram](#2-the-big-picture-in-one-diagram)
 3. [Meet the Cast — what each file is for](#3-meet-the-cast)
 4. [A Day in the Life of One Fingerprint Punch](#4-a-day-in-the-life-of-one-fingerprint-punch)
-5. [The Three Safety Nets](#5-the-three-safety-nets)
+5. [The Four Safety Nets](#5-the-four-safety-nets)
 6. [The Local Logbook — the durable queue](#6-the-local-logbook)
 7. [The Watchdog — how it heals itself](#7-the-watchdog)
 8. [The `config.json` File, field by field](#8-the-configjson-file)
@@ -106,11 +106,15 @@ been delivered. **The logbook fixes that permanently.**
 │              │  Pusher thread           │ ── HTTPS ──► ERP           │
 │              └──────────────────────────┘                            │
 │                                                                      │
-│  ┌──────────────────┐  ┌──────────────────┐                          │
-│  │ Watchdog (30s)   │  │ End-of-Day       │   ┌────────────────┐     │
-│  │ respawns dead    │  │ 23:55–23:59      │ ─►│ Telegram alerts│     │
-│  │ capture workers  │  │ catch-up safety  │   └────────────────┘     │
-│  └──────────────────┘  └──────────────────┘                          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐    │
+│  │ Watchdog (30s)   │  │ Morning ERP sync │  │ End-of-Day       │    │
+│  │ respawns dead    │  │ 08:00 today-only │  │ 23:55–23:59      │    │
+│  │ capture workers  │  │ late-list flush  │  │ catch-up safety  │    │
+│  └──────────────────┘  └────────┬─────────┘  └────────┬─────────┘    │
+│                                 └──────────┬──────────┘              │
+│                                   ┌────────▼────────┐                │
+│                                   │ Telegram alerts │                │
+│                                   └─────────────────┘                │
 └──────────────────────────────▲───────────────────────────────────────┘
                                │ TCP port 4370 (ZK protocol)
         ┌──────────────────────┴──────────────────────┐
@@ -185,11 +189,10 @@ Let's follow a single punch, end to end.
      out → **nothing is marked synced**, the rows stay in the logbook, and
      the pusher will retry on the next cycle with exponential backoff. A
      Telegram alert is sent (rate-limited so the chat is not spammed).
-6. **The logbook keeps the record forever.** Every synced row stays in the
-   database permanently, so you have a full historical archive of every
-   attendance event the system has ever seen. (You can opt into automatic
-   purging via `purge_synced_after_days` in `config.json` if you ever want
-   to, but the default keeps everything.)
+6. **The logbook keeps the last 90 days.** Synced punches older than
+   `purge_synced_after_days` (default **90**) are deleted automatically at
+   startup and about once an hour. Unsynced rows are never removed. Set the
+   value to `0` if you need a permanent local archive.
 
 That is the entire happy path. Now look at every step where something can go
 wrong — and notice that none of them lose the punch:
@@ -201,20 +204,31 @@ wrong — and notice that none of them lose the punch:
   records flow through.
 * If the **network is down**, same as above.
 * If the **device was unreachable for hours**, the device's own memory holds
-  the punches; the End-of-Day catch-up at 23:55 (and the boot-sync after
-  reboots) re-pulls them from the device into the logbook, idempotently.
+  the punches; the 08:00 morning sync, the End-of-Day catch-up at 23:55,
+  and the boot-sync after reboots re-pull them from the device into the
+  logbook, idempotently.
 
 ---
 
-## 5. The Three Safety Nets
+## 5. The Four Safety Nets
 
-There are three independent paths that get punches into the logbook. They
+There are four independent paths that get punches into the logbook. They
 overlap deliberately. Even if one path is down, another covers it.
 
 ### Net A — Real-Time Capture (the main road)
 
 While both the device and the daemon are online and connected, every punch
 flows in within milliseconds. This is what you want 99% of the time.
+
+### Net A2 — Morning ERP Sync (the 08:00 late-list flush)
+
+Every morning at **08:00** (local time), the daemon re-pulls **today's**
+punches from every device and enqueues anything the live path missed. It
+then waits up to five minutes for the pusher to deliver remaining rows to
+the ERP so staff can see who is late. The job runs once per calendar day
+(`sync_state.last_morning_sync_date`). If the daemon was down at 08:00, it
+catch-up runs the first time it is up after 08:00. Only today is enqueued
+— this is not a 60-day backfill.
 
 ### Net B — End-of-Day Catch-Up (the nightly broom)
 
@@ -238,10 +252,10 @@ logbook. This protects you from:
 The daemon also performs a smaller 3-day "boot recovery" the moment it
 starts, in case the dedicated boot-sync didn't run for some reason.
 
-> **Why three nets?** Because in nine schools, weird things happen. Power
-> goes out. Devices freeze. Networks die at exactly 23:59. The combination
-> of three independent, idempotent paths means **the system catches its own
-> mistakes** without anyone needing to log in.
+> **Why four nets?** Because in nine schools, weird things happen. Power
+> goes out. Devices freeze. Networks die at exactly 08:00 or 23:59. The
+> combination of independent, idempotent paths means **the system catches
+> its own mistakes** without anyone needing to log in.
 
 ---
 
@@ -279,6 +293,7 @@ A tiny key/value table for run-to-run state:
 | Key | Meaning |
 |---|---|
 | `last_eod_date` | The most recent date the End-of-Day catch-up succeeded. |
+| `last_morning_sync_date` | The most recent date the 08:00 morning ERP sync succeeded. |
 | `last_boot_recovery_at` | Last time the daemon performed a boot-time recovery. |
 
 ---
@@ -329,9 +344,11 @@ up; rarely touch it again. After any edit, restart the service.
     "notifications": {
       "startup": true,
       "end_of_day": true,
+      "morning_sync": true,
       "data_push": true,
       "errors": true,
-      "device_status": true
+      "device_status": true,
+      "cleanup": true
     }
   }
 }
@@ -368,10 +385,14 @@ durable queue without touching code:
     "push_interval_s": 15,
     "push_timeout_s": 60,
     "push_retries": 5,
-    "purge_synced_after_days": 0,
+    "purge_synced_after_days": 90,
     "watchdog_interval_s": 30,
     "reconnect_interval_min": 15,
     "eod_lookback_days": 1,
+    "morning_sync_hour": 8,
+    "morning_sync_minute": 0,
+    "morning_sync_window_min": 5,
+    "morning_sync_drain_timeout_s": 300,
     "boot_recovery_days": 3,
     "boot_sync_days": 60
   }
@@ -385,10 +406,14 @@ durable queue without touching code:
 | `push_interval_s` | How often the pusher polls the logbook. |
 | `push_timeout_s` | HTTP timeout per push. |
 | `push_retries` | How many times each push is retried before backing off. |
-| `purge_synced_after_days` | `0` = **keep records forever** (default). Set to a positive number (e.g. `90`) only if you want synced rows automatically deleted after that many days to save disk. |
+| `purge_synced_after_days` | How long to keep **synced** local punches. Default **90**. Age is the punch timestamp. `0` keeps everything forever. Must not be shorter than `boot_sync_days` (the daemon raises it if it is). |
 | `watchdog_interval_s` | How often the watchdog checks capture workers. |
 | `reconnect_interval_min` | Periodic full reconnect cycle. |
 | `eod_lookback_days` | Daily 23:55 catch-up scans this many recent days. |
+| `morning_sync_hour` | Local hour for the morning ERP completeness pass. Default `8`. |
+| `morning_sync_minute` | Local minute. Default `0` (exactly 08:00). |
+| `morning_sync_window_min` | Primary retry window after the start time. Default `5`. After the window the job still catch-up runs if it has not succeeded today. |
+| `morning_sync_drain_timeout_s` | How long to wait for the pusher to empty the queue after the morning pull. Default `300`. |
 | `boot_recovery_days` | Daemon-start recovery scans this many recent days. |
 | `boot_sync_days` | The boot-sync subprocess scans this many days. |
 
@@ -582,6 +607,15 @@ strongly preferred for production.
        capture → enqueue → push → mark synced.
        At most one Telegram "Sync OK" message per 10 minutes.
 
+08:00  Morning ERP sync starts (today only).
+       Daemon re-pulls each device's stored punches for today.
+       Anything already in the logbook is silently ignored.
+       Anything the live path missed is enqueued.
+       Job waits up to 5 minutes for the pusher to drain to the ERP.
+       One Telegram "Morning ERP Sync Complete" message.
+       last_morning_sync_date is set so it will not run again today.
+       If the daemon was down at 08:00, this catch-up runs later.
+
 09:15  Brief school-wifi blip for ~30 s.
        Pusher's HTTP call fails. Records stay in the logbook.
        Pusher retries with exponential backoff.
@@ -599,7 +633,7 @@ strongly preferred for production.
        Pusher delivers the new rows.
        One Telegram "End-of-Day Complete" message.
 
-00:00  New day starts. last_eod_date is updated.
+00:00  New day starts. last_eod_date / last_morning_sync_date roll over.
        Cycle repeats.
 ```
 
@@ -616,8 +650,10 @@ The school's chat / group sees a **small number of high-signal messages**:
 | ❌ **Sync Failed** | A push failed (rate-limited to once per 5 minutes). |
 | ✅ **Sync Recovered** | The first success after a string of failures. |
 | ⚠️ **Worker Restarted** | The watchdog respawned a dead device worker (rate-limited per device). |
+| 🌅 **Morning ERP Sync Started / Complete** | 08:00 today-only completeness pass (late lists). |
 | 🧹 **End-of-Day Started / Complete** | Nightly catch-up cycle. |
 | 🚀 **Boot Sync Started / Complete / Failed** | Power-on backfill. |
+| 🧽 **Queue Cleanup** | Synced punches older than 90 days were removed (or cleanup failed). |
 | 👋 **System Stopped** | Daemon was shut down. |
 | 💥 **Fatal Error** | Truly unexpected — should be very rare. |
 
@@ -896,11 +932,11 @@ du -h data/attendance_queue.db
 |---|---|
 | ERP server is down for 2 hours | Records pile up in the logbook. Pusher retries with backoff. As soon as the ERP is back, all records flow through. **No human action needed.** |
 | Internet is down for half a day | Same as above. |
-| Biometric device is unplugged briefly | The capture worker errors out, the watchdog respawns it, the worker retries to connect with exponential backoff. When the device returns, the worker reconnects. End-of-Day pulls anything that happened during the outage from the device's own memory. |
+| Biometric device is unplugged briefly | The capture worker errors out, the watchdog respawns it, the worker retries to connect with exponential backoff. When the device returns, the worker reconnects. The 08:00 morning sync and End-of-Day pull anything that happened during the outage from the device's own memory. |
 | The whole school server crashes / reboots | The logbook is on disk. When the server comes back, the daemon resumes from the same logbook state. `boot_sync_30d.py` also runs to backfill the last 60 days from each device. |
 | Power outage right when a punch is happening | The device may or may not record the punch (that's a hardware property). If it did, the next reconnect / catch-up captures it. If it didn't, no software in the world can recover it. |
 | A bug in the daemon throws an exception | The bad record's exception is logged, the surrounding loop continues, and systemd will restart the process if it ever exits. The daemon never silently dies. |
-| Same punch arrives twice (e.g. real-time + end-of-day) | The logbook ignores the duplicate. The ERP sees it exactly once. |
+| Same punch arrives twice (e.g. real-time + morning sync + end-of-day) | The logbook ignores the duplicate. The ERP sees it exactly once. |
 | Pusher gets HTTP 500 from ERP | Records are NOT marked synced. They stay pending. Pusher retries with backoff. Telegram alert is sent. |
 | Pusher gets HTTP 200 | Records ARE marked synced. Telegram "Sync OK" (rate-limited). |
 
@@ -982,31 +1018,30 @@ sudo journalctl -u attendance-ztech --no-pager | tail -50
 
 ### The logbook is huge
 
-By default, **every record is kept forever** — you have a permanent
-attendance archive on the server. Each row is ~300 bytes, so even
-100,000 records/year only adds ~30 MB/year. Most schools never need to
-worry about this.
+The daemon keeps only the last **90 days** of synced punches by default
+(`purge_synced_after_days`). Cleanup runs at every startup (then VACUUMs
+the SQLite file) and about once an hour. Telegram sends a `cleanup`
+alert when rows are removed, on the startup pass, and if cleanup fails.
 
-If you ever do want to free space, you have two options:
-
-**Option A — turn on automatic purge** (e.g. keep last 365 days):
+To keep everything forever:
 
 ```json
-"sync": { "purge_synced_after_days": 365 }
+"sync": { "purge_synced_after_days": 0 }
 ```
 
-Restart the service. Synced rows older than 365 days are then deleted
-automatically once an hour.
+To change the window (must be ≥ `boot_sync_days`, usually 60):
 
-**Option B — one-off manual cleanup**:
+```json
+"sync": { "purge_synced_after_days": 90 }
+```
+
+Manual one-off (never delete `synced = 0`):
 
 ```bash
 sqlite3 data/attendance_queue.db \
-  "DELETE FROM attendance_queue WHERE synced = 1 AND created_at < '2025-01-01';"
+  "DELETE FROM attendance_queue WHERE synced = 1 AND timestamp < '2025-01-01';"
 sqlite3 data/attendance_queue.db "VACUUM;"
 ```
-
-(Never delete rows where `synced = 0` — those have not been delivered yet.)
 
 ---
 
@@ -1094,6 +1129,7 @@ A: Two places:
                 └─────────┘ └─────────┘ └─────────┘
 
        Watchdog (in main.py)  →  every 30 s respawns dead capture workers
+       Morning sync (in main.py) →  08:00 today-only pull + ERP drain wait
        End-of-Day  (in main.py) →  23:55-23:59 catch-up via get_attendance()
        Boot recovery (main.py) →  3-day catch-up at daemon start
        boot_sync_30d.py        →  60-day catch-up at machine boot

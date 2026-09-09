@@ -25,7 +25,12 @@
   "sync": {
     "boot_sync_days": 60,
     "boot_recovery_days": 60,
-    "eod_lookback_days": 1
+    "eod_lookback_days": 1,
+    "purge_synced_after_days": 90,
+    "morning_sync_hour": 8,
+    "morning_sync_minute": 0,
+    "morning_sync_window_min": 5,
+    "morning_sync_drain_timeout_s": 300
   },
 
   "telegram": {
@@ -35,9 +40,11 @@
     "notifications": {
       "startup": true,
       "end_of_day": true,
+      "morning_sync": true,
       "data_push": true,
       "errors": true,
-      "device_status": true
+      "device_status": true,
+      "cleanup": true
     }
   }
 }
