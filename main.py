@@ -164,7 +164,17 @@ PUSH_INTERVAL_S      = max(1,  int(_SYNC_CFG.get("push_interval_s", 15)))
 PUSH_TIMEOUT_S       = max(5,  int(_SYNC_CFG.get("push_timeout_s", 60)))
 PUSH_RETRIES         = max(1,  int(_SYNC_CFG.get("push_retries", 5)))
 _RAW_PURGE_DAYS      = int(_SYNC_CFG.get("purge_synced_after_days", 90))
-PURGE_INTERVAL_S     = max(300, int(_SYNC_CFG.get("purge_interval_s", 3600)))
+# Retention cleanup cadence: default once a month. Prefer purge_interval_days
+# when set; otherwise purge_interval_s (legacy). Minimum 1 day / 5 minutes.
+_DEFAULT_PURGE_INTERVAL_S = 30 * 24 * 3600
+if "purge_interval_days" in _SYNC_CFG:
+    PURGE_INTERVAL_S = max(
+        86400, int(_SYNC_CFG.get("purge_interval_days", 30)) * 86400
+    )
+elif "purge_interval_s" in _SYNC_CFG:
+    PURGE_INTERVAL_S = max(300, int(_SYNC_CFG["purge_interval_s"]))
+else:
+    PURGE_INTERVAL_S = _DEFAULT_PURGE_INTERVAL_S
 PURGE_VACUUM_MIN_DELETED = max(
     1, int(_SYNC_CFG.get("purge_vacuum_min_deleted", 100))
 )
@@ -233,13 +243,18 @@ telegram_notifier = TelegramNotifier(
 _retention = (
     "forever" if PURGE_DAYS <= 0 else f"{PURGE_DAYS}d (punch timestamp)"
 )
+_purge_every = (
+    "off"
+    if PURGE_DAYS <= 0
+    else f"every {max(1, PURGE_INTERVAL_S // 86400)}d"
+)
 logger.info(
     f"Config: devices={len(DEVICES)} endpoint={ENDPOINT} "
     f"batch_size={PUSH_BATCH_SIZE} push_interval_s={PUSH_INTERVAL_S} "
     f"reconnect_interval_s={RECONNECT_INTERVAL_S} db={DB_PATH} "
     f"boot_sync_days={BOOT_SYNC_DAYS} eod_lookback_days={EOD_LOOKBACK_DAYS} "
     f"morning_sync={MORNING_SYNC_HOUR:02d}:{MORNING_SYNC_MINUTE:02d} "
-    f"retention={_retention} "
+    f"retention={_retention} purge={_purge_every} "
     f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
 )
 
@@ -635,7 +650,7 @@ def pusher_loop(stop_event: threading.Event) -> None:
                 continue
 
             if PURGE_DAYS > 0 and now - last_purge >= PURGE_INTERVAL_S:
-                run_retention_cleanup(reason="hourly", force_vacuum=False)
+                run_retention_cleanup(reason="scheduled", force_vacuum=False)
                 last_purge = now
 
             if pending == 0:

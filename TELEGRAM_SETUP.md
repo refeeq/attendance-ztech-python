@@ -102,7 +102,7 @@ This will send test notifications to your Telegram chat to confirm the setup is 
 
 ### Queue Cleanup
 - **Startup cleanup**: How many synced punches older than the retention window were removed, remaining rows, and disk size before/after VACUUM
-- **Hourly cleanup**: Sent when the hourly pass actually deleted rows
+- **Scheduled cleanup**: Sent when the monthly (or configured) pass actually deleted rows
 - **Cleanup failure**: Sent if the delete/VACUUM fails (also honors the `errors` flag)
 
 ### Daily Summary

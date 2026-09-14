@@ -191,8 +191,9 @@ Let's follow a single punch, end to end.
      Telegram alert is sent (rate-limited so the chat is not spammed).
 6. **The logbook keeps the last 90 days.** Synced punches older than
    `purge_synced_after_days` (default **90**) are deleted automatically at
-   startup and about once an hour. Unsynced rows are never removed. Set the
-   value to `0` if you need a permanent local archive.
+   startup and about once a month (`purge_interval_days`, default **30**).
+   Unsynced rows are never removed. Set the value to `0` if you need a
+   permanent local archive.
 
 That is the entire happy path. Now look at every step where something can go
 wrong — and notice that none of them lose the punch:
@@ -386,6 +387,7 @@ durable queue without touching code:
     "push_timeout_s": 60,
     "push_retries": 5,
     "purge_synced_after_days": 90,
+    "purge_interval_days": 30,
     "watchdog_interval_s": 30,
     "reconnect_interval_min": 15,
     "eod_lookback_days": 1,
@@ -407,6 +409,7 @@ durable queue without touching code:
 | `push_timeout_s` | HTTP timeout per push. |
 | `push_retries` | How many times each push is retried before backing off. |
 | `purge_synced_after_days` | How long to keep **synced** local punches. Default **90**. Age is the punch timestamp. `0` keeps everything forever. Must not be shorter than `boot_sync_days` (the daemon raises it if it is). |
+| `purge_interval_days` | How often to run that retention cleanup after startup. Default **30** (once a month). |
 | `watchdog_interval_s` | How often the watchdog checks capture workers. |
 | `reconnect_interval_min` | Periodic full reconnect cycle. |
 | `eod_lookback_days` | Daily 23:55 catch-up scans this many recent days. |
@@ -1020,8 +1023,9 @@ sudo journalctl -u attendance-ztech --no-pager | tail -50
 
 The daemon keeps only the last **90 days** of synced punches by default
 (`purge_synced_after_days`). Cleanup runs at every startup (then VACUUMs
-the SQLite file) and about once an hour. Telegram sends a `cleanup`
-alert when rows are removed, on the startup pass, and if cleanup fails.
+the SQLite file) and about once a month (`purge_interval_days`). Telegram
+sends a `cleanup` alert when rows are removed, on the startup pass, and if
+cleanup fails.
 
 To keep everything forever:
 

@@ -27,6 +27,7 @@
     "boot_recovery_days": 60,
     "eod_lookback_days": 1,
     "purge_synced_after_days": 90,
+    "purge_interval_days": 30,
     "morning_sync_hour": 8,
     "morning_sync_minute": 0,
     "morning_sync_window_min": 5,

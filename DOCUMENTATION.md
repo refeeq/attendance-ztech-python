@@ -909,6 +909,7 @@ All optional. Defaults shown. Existing configs work unchanged.
     "push_timeout_s": 60,
     "push_retries": 5,
     "purge_synced_after_days": 90,
+    "purge_interval_days": 30,
     "watchdog_interval_s": 30,
     "reconnect_interval_min": 15,
     "eod_lookback_days": 1,
@@ -930,6 +931,7 @@ All optional. Defaults shown. Existing configs work unchanged.
 | `push_timeout_s` | HTTP timeout per push. |
 | `push_retries` | Retries per push attempt before backing off. |
 | `purge_synced_after_days` | Keep only this many days of **synced** local punches (default **90**). Age is the punch timestamp. `0` disables cleanup. Raised automatically if shorter than `boot_sync_days`. Telegram `cleanup` alerts report what was removed. |
+| `purge_interval_days` | How often to run retention cleanup after startup (default **30** = once a month). |
 | `watchdog_interval_s` | Cadence of the device-process health check. |
 | `reconnect_interval_min` | Periodic full reconnect cycle (safety net). |
 | `eod_lookback_days` | Daily EoD pulls today + this many prior days (idempotent). |
