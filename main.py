@@ -197,6 +197,11 @@ RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 30)) 
 DEVICE_CONNECT_TIMEOUT_S = max(5, int(_SYNC_CFG.get("device_connect_timeout_s", 15)))
 DEVICE_IO_TIMEOUT_S = max(10, int(_SYNC_CFG.get("device_io_timeout_s", 60)))
 CAPTURE_MAX_BACKOFF_S = max(5, int(_SYNC_CFG.get("capture_max_backoff_s", 60)))
+# Punches made while a terminal was unreachable stay on the terminal; after
+# an outage at least this long, pull them as soon as it is back.
+OUTAGE_CATCHUP_MIN_S = max(10, int(_SYNC_CFG.get("outage_catchup_min_s", 60)))
+OUTAGE_CATCHUP_RETRY_S = max(60, int(_SYNC_CFG.get("outage_catchup_retry_s", 600)))
+CATCHUP_STATE_PREFIX = "catchup_from:"
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
 MORNING_SYNC_HOUR = max(0, min(23, int(_SYNC_CFG.get("morning_sync_hour", 8))))
 MORNING_SYNC_MINUTE = max(
@@ -925,6 +930,36 @@ def pusher_loop(stop_event: threading.Event) -> None:
 # Per-device real-time capture (subprocess target)
 # ---------------------------------------------------------------------------
 
+def _request_outage_catchup(
+    local_queue: AttendanceQueue,
+    device_id: Any,
+    outage_since: float,
+    down_s: float,
+    log: logging.Logger,
+) -> None:
+    """Ask the parent to pull what this terminal stored while it was offline.
+
+    The request lives in sync_state so it survives a daemon restart; the
+    earliest pending date wins if the terminal flaps before it is served.
+    """
+    key = f"{CATCHUP_STATE_PREFIX}{device_id}"
+    # Margin covers the time the dead session took to be noticed.
+    since = datetime.fromtimestamp(outage_since - 300).date().isoformat()
+    try:
+        current = local_queue.get_state(key)
+        if current and current <= since:
+            since = current
+        local_queue.set_state(key, since)
+        log.info(
+            f"🧩 [device {device_id}] was unreachable for {int(down_s)}s; "
+            f"queued catch-up pull of punches since {since}"
+        )
+    except Exception as exc:
+        log.warning(
+            f"⚠️ [device {device_id}] could not queue outage catch-up: {exc}"
+        )
+
+
 def capture_real_time_logs(device: dict, db_path: str) -> None:
     """Connect to a single ZKTeco device and stream punches into the queue.
 
@@ -965,6 +1000,7 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
 
     backoff = 5
     failures = 0
+    outage_since: Optional[float] = None
     while not stopping["flag"]:
         if _orphaned():
             sub_logger.warning(
@@ -989,6 +1025,13 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
             )
             if alerts is not None:
                 alerts.note_recovered(device_id)
+            if outage_since is not None:
+                down_s = time.time() - outage_since
+                if down_s >= OUTAGE_CATCHUP_MIN_S:
+                    _request_outage_catchup(
+                        local_queue, device_id, outage_since, down_s, sub_logger
+                    )
+                outage_since = None
             backoff = 5
             failures = 0
 
@@ -1019,6 +1062,8 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
                 raise ConnectionError("live capture stream ended")
         except Exception as exc:
             failures += 1
+            if outage_since is None:
+                outage_since = time.time()
             reason = str(exc) or type(exc).__name__
             # A single blip (e.g. the terminal still busy right after a
             # history pull closed its session) is retried quickly and not
@@ -1469,6 +1514,75 @@ def stop_processes(
 # Boot recovery (rate-limited so a crash-loop doesn't thrash the devices)
 # ---------------------------------------------------------------------------
 
+_catchup_last_attempt: Dict[Any, float] = {}
+
+
+def _next_outage_catchup(now: float) -> Optional[Tuple[dict, str]]:
+    for d in DEVICES:
+        did = d.get("device_id")
+        if now - _catchup_last_attempt.get(did, 0.0) < OUTAGE_CATCHUP_RETRY_S:
+            continue
+        try:
+            since = queue.get_state(f"{CATCHUP_STATE_PREFIX}{did}")
+        except Exception:
+            return None
+        if since:
+            _catchup_last_attempt[did] = now
+            return d, since
+    return None
+
+
+def _run_outage_catchup(
+    device: dict, since: str, processes: Dict[Any, Process]
+) -> None:
+    """Pull one terminal's punches from ``since`` to today. Caller sets
+    ``_history_pull_active``; this clears it."""
+    did = device.get("device_id")
+    key = f"{CATCHUP_STATE_PREFIX}{did}"
+    try:
+        try:
+            start = date.fromisoformat(since)
+        except ValueError:
+            queue.set_state(key, "")
+            return
+        today = date.today()
+        days = min(BOOT_SYNC_DAYS, max(1, (today - start).days + 1))
+        target_dates = {
+            (today - timedelta(days=i)).isoformat() for i in range(days)
+        }
+        logger.info(
+            f"🧩 [device {did}] outage catch-up: pulling {days}d "
+            f"({since} → {today})"
+        )
+        try:
+            new = _pull_one_device_history(device, target_dates, processes)
+        except Exception as exc:
+            logger.warning(
+                f"⚠️ [device {did}] outage catch-up failed ({exc}); "
+                f"retrying in {OUTAGE_CATCHUP_RETRY_S // 60} min"
+            )
+            return
+        if queue.get_state(key) == since:
+            queue.set_state(key, "")
+        logger.info(
+            f"🧩 [device {did}] outage catch-up done: {new} missed "
+            f"punch(es) queued for the ERP"
+        )
+        if new:
+            tg_send(
+                f"🧩 <b>Outage Catch-up</b>\n"
+                f"🖥️ Device: {did}\n"
+                f"📆 Since: {since}\n"
+                f"🧾 Missed punches recovered: {new}",
+                kind=f"outage_catchup_{did}",
+                min_interval_s=60,
+            )
+    except Exception as exc:
+        logger.exception(f"Outage catch-up error for device {did}: {exc}")
+    finally:
+        _history_pull_active.clear()
+
+
 def maybe_run_boot_recovery(
     force_extended: bool = False,
     processes: Optional[Dict[Any, Process]] = None,
@@ -1642,6 +1756,7 @@ def main() -> None:
     last_morning_attempt = 0.0
     last_wal_checkpoint = time.time()
     last_integrity_check = time.time()
+    last_catchup_check = 0.0
     last_eod_done_marker: Optional[str] = queue.get_state("last_eod_date")
     last_morning_done_marker: Optional[str] = queue.get_state(
         "last_morning_sync_date"
@@ -1669,6 +1784,26 @@ def main() -> None:
                     stop_processes(processes)
                     supervise_processes(processes)
                     last_reconnect = now
+
+                if (
+                    now - last_catchup_check >= 30
+                    and not _history_pull_active.is_set()
+                    and not is_manual_backfill_active(DB_PATH)
+                ):
+                    last_catchup_check = now
+                    job = _next_outage_catchup(now)
+                    if job is not None:
+                        _history_pull_active.set()
+                        try:
+                            threading.Thread(
+                                target=_run_outage_catchup,
+                                args=(job[0], job[1], processes),
+                                name=f"catchup-{job[0].get('device_id')}",
+                                daemon=True,
+                            ).start()
+                        except Exception:
+                            _history_pull_active.clear()
+                            raise
 
                 if now - last_wal_checkpoint >= WAL_CHECKPOINT_INTERVAL_S:
                     try:
