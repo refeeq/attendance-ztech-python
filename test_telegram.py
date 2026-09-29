@@ -7,6 +7,7 @@ Run this script to test if your Telegram bot is working correctly.
 import json
 import sys
 from datetime import datetime
+from error_alerts import alerts_configured, attach_error_alerts, resolve_alert_settings
 from telegram_notifier import TelegramNotifier
 
 def load_config():
@@ -162,6 +163,37 @@ def test_telegram_bot():
     print("   Check your Telegram chat to see the test messages.")
     return True
 
+
+def test_alert_bot():
+    """Send one message to the separate error-alert bot."""
+    print("🧪 Testing error-alert bot...")
+    config = load_config()
+    settings = resolve_alert_settings(config)
+    if not alerts_configured(settings):
+        print("⚠️ Error-alert bot is not configured.")
+        print("   Add telegram_alerts in config.json (a different bot), then:")
+        print("   python test_telegram.py --alerts")
+        return False
+
+    import logging
+    log = logging.getLogger("AttendanceZTechAlertTest")
+    log.handlers.clear()
+    log.addHandler(logging.NullHandler())
+    handler = attach_error_alerts(
+        log,
+        config,
+        str(config.get("name") or "Attendance"),
+        list(config.get("devices") or []),
+    )
+    if handler is None:
+        print("❌ Error-alert bot did not start. Check bot_token and chat_id.")
+        return False
+    if handler.send_test():
+        print("✅ Error-alert test sent. Check that Telegram chat.")
+        return True
+    print("❌ Error-alert test failed to send.")
+    return False
+
 def show_setup_instructions():
     """Show setup instructions for Telegram bot"""
     print("📋 Telegram Bot Setup Instructions")
@@ -187,14 +219,21 @@ def show_setup_instructions():
     print("4. Run this test script again:")
     print("   python test_telegram.py")
     print()
+    print("Error alerts use a second bot. See telegram_alerts in config.json")
+    print("and run: python test_telegram.py --alerts")
+    print()
 
 if __name__ == "__main__":
     print("🤖 Attendance ZTech - Telegram Bot Test")
     print("=" * 50)
     print()
-    
+
     try:
-        if test_telegram_bot():
+        if "--alerts" in sys.argv:
+            ok = test_alert_bot()
+        else:
+            ok = test_telegram_bot()
+        if ok:
             print("✅ All tests passed! Your Telegram bot is ready to use.")
         else:
             print("❌ Some tests failed. Please check the configuration.")

@@ -47,5 +47,12 @@
       "device_status": true,
       "cleanup": true
     }
+  },
+
+  "telegram_alerts": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "repeat_after_s": 600
   }
 }

@@ -74,6 +74,21 @@ def _recovery_lock_path(db_path: str) -> Path:
     return _resolve_db_path(db_path).parent / ".queue_recovery.lock"
 
 
+def manual_backfill_lock_path(db_path: str) -> Path:
+    """Lock file created by ``sync_60_days.sh`` while a manual pull is running."""
+    return _resolve_db_path(db_path).parent / ".manual_backfill.lock"
+
+
+def is_manual_backfill_active(db_path: str, max_age_s: float = 6 * 3600) -> bool:
+    """True when a desktop/manual backfill holds the history-pull lock."""
+    path = manual_backfill_lock_path(db_path)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age < max_age_s
+
+
 @contextmanager
 def _recovery_lock(db_path: str, wait_s: float = 120.0):
     """Serialize queue recovery across PM2 restart storms."""
@@ -185,7 +200,11 @@ def _sqlite3_cli_available() -> Optional[str]:
 
 
 def _attempt_sqlite_recover(source_db: Path, dest_db: Path) -> tuple[bool, str]:
-    """Use the ``sqlite3`` CLI ``.recover`` to rebuild a damaged database."""
+    """Use the ``sqlite3`` CLI ``.recover`` to rebuild a damaged database.
+
+    ``.recover`` prints SQL on stdout; that script must be loaded into a new
+    database file (writing the SQL bytes as a .db was a no-op repair).
+    """
     cli = _sqlite3_cli_available()
     if not cli:
         return False, "sqlite3 CLI not installed"
@@ -195,19 +214,28 @@ def _attempt_sqlite_recover(source_db: Path, dest_db: Path) -> tuple[bool, str]:
     if dest_db.exists():
         dest_db.unlink()
     try:
-        with open(dest_db, "wb") as out_fh:
-            proc = subprocess.run(
-                [cli, str(source_db), ".recover"],
-                stdout=out_fh,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=600,
-            )
-        if proc.returncode != 0:
-            err = (proc.stderr or b"").decode("utf-8", errors="replace")[:500]
+        dump = subprocess.run(
+            [cli, str(source_db), ".recover"],
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+        sql = dump.stdout or b""
+        if not sql.strip():
+            err = (dump.stderr or b"").decode("utf-8", errors="replace")[:500]
+            return False, err or "sqlite3 .recover produced no SQL"
+        load = subprocess.run(
+            [cli, str(dest_db)],
+            input=sql,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+        if load.returncode != 0:
+            err = (load.stderr or b"").decode("utf-8", errors="replace")[:500]
             if dest_db.exists():
                 dest_db.unlink()
-            return False, err or f"sqlite3 .recover exit {proc.returncode}"
+            return False, err or f"sqlite3 load exit {load.returncode}"
     except subprocess.TimeoutExpired:
         if dest_db.exists():
             dest_db.unlink()
@@ -354,6 +382,7 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
     conn.execute("PRAGMA busy_timeout=30000;")
+    conn.executescript(_SCHEMA)
     return conn
 
 
@@ -405,11 +434,7 @@ class AttendanceQueue:
             return None
 
     # ------------------------------------------------------------------ enqueue
-    def enqueue_many(self, records: Iterable[Dict[str, Any]]) -> int:
-        """Insert records idempotently. Returns count of NEW rows."""
-        rows = [r for r in (self._normalize(rec) for rec in records) if r]
-        if not rows:
-            return 0
+    def _insert_rows(self, rows: List[tuple]) -> int:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE;")
             try:
@@ -431,6 +456,28 @@ class AttendanceQueue:
                 except Exception:
                     pass
                 raise
+
+    def enqueue_many(self, records: Iterable[Dict[str, Any]]) -> int:
+        """Insert records idempotently. Returns count of NEW rows."""
+        rows = [r for r in (self._normalize(rec) for rec in records) if r]
+        if not rows:
+            return 0
+        try:
+            return self._insert_rows(rows)
+        except Exception as exc:
+            if not is_sqlite_corruption_error(exc):
+                raise
+            logger.critical(
+                "Queue corrupt during enqueue (%s); attempting auto-repair",
+                exc,
+            )
+            ok, action, detail = ensure_sqlite_queue_db(self.db_path)
+            if not ok:
+                raise
+            logger.warning(
+                "Queue repaired (%s): %s; retrying enqueue", action, detail
+            )
+            return self._insert_rows(rows)
 
     def enqueue_one(self, record: Dict[str, Any]) -> bool:
         return self.enqueue_many([record]) > 0

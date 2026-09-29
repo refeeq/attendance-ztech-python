@@ -65,6 +65,46 @@ Edit your `config.json` file and update the Telegram section:
 }
 ```
 
+### 3b. Separate bot for sync errors
+
+Status messages (startup, successful pushes, end of day) stay on the bot above.
+Capture timeouts, broken device links, and ERP sync failures go to a **second**
+bot so that chat is only problems.
+
+1. In BotFather, send `/newbot` again and create a different bot (for example
+   `Pace Attendance Alerts`).
+2. Open that bot and send it any message.
+3. Open `https://api.telegram.org/bot<NEW_BOT_TOKEN>/getUpdates` and copy the
+   chat `id`.
+4. On the server, edit the `config.json` next to `main.py`:
+
+```json
+"telegram_alerts": {
+  "enabled": true,
+  "bot_token": "NEW_BOT_TOKEN",
+  "chat_id": "YOUR_CHAT_ID",
+  "repeat_after_s": 600
+}
+```
+
+`repeat_after_s` is how long to wait before reminding you that the **same**
+failure is still happening. The first failure is always sent immediately.
+Device 3 timing out every second becomes one message, then a reminder with a
+count, then a "capture restored" message when it reconnects.
+
+5. Test, then restart the service:
+
+```bash
+python test_telegram.py --alerts
+pm2 restart attendance-sync --update-env
+```
+
+In `pm2 logs` you should see `Error alerts ON`. The alert chat gets one
+"Error watch is on" message at startup.
+
+You can set `TELEGRAM_ALERTS_BOT_TOKEN`, `TELEGRAM_ALERTS_CHAT_ID`, and
+`TELEGRAM_ALERTS_ENABLED=1` instead of putting the token in `config.json`.
+
 ### 4. Install Dependencies
 
 Make sure you have the required dependencies installed:

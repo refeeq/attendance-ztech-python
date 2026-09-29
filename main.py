@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import os
 import signal
 import socket
@@ -49,14 +50,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from zk import ZK
+from zk.base import ZK_helper
 
 from storage import (
     DEFAULT_DB_PATH,
     AttendanceQueue,
     checkpoint_wal,
     ensure_sqlite_queue_db,
+    is_manual_backfill_active,
     is_sqlite_corruption_error,
     verify_sqlite_queue_db,
+)
+from error_alerts import (
+    announce_error_alerts,
+    attach_error_alerts,
+    tap_capture_stdout,
 )
 from telegram_notifier import TelegramNotifier
 
@@ -182,7 +190,12 @@ PURGE_VACUUM_MIN_DELETED = max(
 # so large queue drain does not hit Telegram 429.
 TG_DATA_PUSH_PROGRESS_INTERVAL_S = 300
 WATCHDOG_INTERVAL_S  = max(5,  int(_SYNC_CFG.get("watchdog_interval_s", 30)))
-RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 15)) * 60)
+RECONNECT_INTERVAL_S = max(60, int(_SYNC_CFG.get("reconnect_interval_min", 30)) * 60)
+# pyzk uses one timeout for the handshake and every later read. Keep the
+# handshake short so a busy terminal fails fast, then widen it for transfers.
+DEVICE_CONNECT_TIMEOUT_S = max(5, int(_SYNC_CFG.get("device_connect_timeout_s", 15)))
+DEVICE_IO_TIMEOUT_S = max(10, int(_SYNC_CFG.get("device_io_timeout_s", 60)))
+CAPTURE_MAX_BACKOFF_S = max(5, int(_SYNC_CFG.get("capture_max_backoff_s", 60)))
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
 MORNING_SYNC_HOUR = max(0, min(23, int(_SYNC_CFG.get("morning_sync_hour", 8))))
 MORNING_SYNC_MINUTE = max(
@@ -256,6 +269,10 @@ logger.info(
     f"morning_sync={MORNING_SYNC_HOUR:02d}:{MORNING_SYNC_MINUTE:02d} "
     f"retention={_retention} purge={_purge_every} "
     f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
+)
+
+error_alert_handler = attach_error_alerts(
+    logger, config, SYSTEM_NAME, DEVICES
 )
 
 
@@ -587,6 +604,117 @@ def _record_from_zk(log_obj: Any, device_id: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+class DeviceConnectError(RuntimeError):
+    pass
+
+
+def _zk_sock(conn: Any) -> Optional[socket.socket]:
+    return getattr(conn, "_ZK__sock", None)
+
+
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Detect a vanished terminal within ~1 min instead of never.
+
+    live_capture() treats every recv timeout as "no punch yet", so without
+    keepalive a dead peer leaves the worker waiting forever.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (
+            ("TCP_KEEPIDLE", 30),
+            ("TCP_KEEPINTVL", 10),
+            ("TCP_KEEPCNT", 3),
+        ):
+            opt = getattr(socket, name, None)
+            if opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+    except OSError:
+        pass
+
+
+def _describe_connect_failure(
+    ip: str, port: int, exc: BaseException, udp: bool
+) -> str:
+    detail = str(exc) or type(exc).__name__
+    if "ping" in detail:
+        return f"device not answering ping ({detail})"
+    if udp:
+        return f"UDP handshake failed ({detail})"
+    try:
+        rc = ZK_helper(ip, port).test_tcp()
+    except Exception:
+        rc = -1
+    if rc not in (0, -1):
+        return (
+            f"TCP {port} refused/unreachable ({os.strerror(rc)}) although "
+            f"ping works; SDK port closed or comm settings changed"
+        )
+    if "timed out" in detail:
+        return (
+            f"TCP {port} open but no ZK handshake reply in "
+            f"{DEVICE_CONNECT_TIMEOUT_S}s; the terminal's SDK sessions are "
+            f"busy or its comm stack is hung"
+        )
+    return detail
+
+
+def _zk_close(conn: Any) -> None:
+    """Send CMD_EXIT so the terminal frees the session, then drop the socket.
+
+    ZKTeco terminals allow only a few SDK sessions; a socket that is closed
+    without CMD_EXIT can keep a slot busy until the terminal times it out.
+    """
+    if conn is None:
+        return
+    sock = _zk_sock(conn)
+    if getattr(conn, "is_connect", False):
+        try:
+            if sock is not None:
+                sock.settimeout(3)
+            conn.disconnect()
+        except Exception:
+            pass
+    if sock is not None:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _zk_open(
+    device: dict,
+    *,
+    force_udp: bool = False,
+    io_timeout: int = DEVICE_IO_TIMEOUT_S,
+) -> Any:
+    ip = str(device.get("ip_address", ""))
+    port = int(device.get("port", 4370) or 4370)
+    zk = ZK(
+        ip,
+        port=port,
+        timeout=DEVICE_CONNECT_TIMEOUT_S,
+        password=_safe_password(device),
+        force_udp=force_udp,
+        ommit_ping=False,
+    )
+    try:
+        conn = zk.connect()
+        if not conn:
+            raise RuntimeError("connect() returned None")
+    except Exception as exc:
+        _zk_close(zk)
+        raise DeviceConnectError(
+            _describe_connect_failure(ip, port, exc, force_udp)
+        ) from exc
+    sock = _zk_sock(conn)
+    if sock is not None:
+        if not force_udp:
+            _enable_keepalive(sock)
+        sock.settimeout(io_timeout)
+    conn._ZK__timeout = io_timeout
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # ERP push
 # ---------------------------------------------------------------------------
@@ -781,43 +909,72 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
     single ZK / network hiccup does not silently kill capture; the parent
     watchdog also respawns the process if it ever exits.
     """
+    stopping = {"flag": False}
+
+    # Forked children inherit the parent's SIGTERM handler, which only sets
+    # the parent's stop_event copy. Without this, terminate() is ignored and
+    # every restart leaks a worker that keeps its device session open.
+    def _on_term(_sig: int, _frame: Any) -> None:
+        if not stopping["flag"]:
+            stopping["flag"] = True
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    parent = multiprocessing.parent_process()
+
+    def _orphaned() -> bool:
+        return parent is not None and not parent.is_alive()
+
     sub_logger = logging.getLogger("AttendanceZTech")
     if not sub_logger.handlers:                       # spawn-mode children
         setup_logging()
         sub_logger = logging.getLogger("AttendanceZTech")
 
     device_id = device.get("device_id", "?")
+    alerts = attach_error_alerts(sub_logger, config, SYSTEM_NAME, DEVICES)
+    tap_capture_stdout(device_id, alerts)
     ip = device.get("ip_address", "?")
     port = int(device.get("port", 4370) or 4370)
-    pwd = _safe_password(device)
+    preferred_udp = bool(device.get("force_udp", False))
     local_queue = AttendanceQueue(db_path)
 
     backoff = 5
-    while True:
+    failures = 0
+    while not stopping["flag"]:
+        if _orphaned():
+            sub_logger.warning(
+                f"⚠️ [device {device_id}] parent daemon gone; worker exiting"
+            )
+            break
+        # After two straight failures alternate transports: some terminals
+        # hang the TCP SDK stack while UDP still answers, and vice versa.
+        use_udp = preferred_udp ^ (failures >= 2 and failures % 2 == 0)
+        transport = "UDP" if use_udp else "TCP"
         conn = None
         try:
             sub_logger.info(
-                f"🔌 [device {device_id}] Connecting to {ip}:{port}"
+                f"🔌 [device {device_id}] Connecting to {ip}:{port} "
+                f"({transport})"
             )
-            zk = ZK(
-                ip,
-                port=port,
-                timeout=50,
-                password=pwd,
-                force_udp=False,
-                ommit_ping=False,
-            )
-            conn = zk.connect()
-            if not conn:
-                raise RuntimeError("connect() returned None")
+            conn = _zk_open(device, force_udp=use_udp)
             conn.enable_device()
             sub_logger.info(
-                f"✅ [device {device_id}] Connected, entering live capture"
+                f"✅ [device {device_id}] Connected ({transport}), "
+                f"entering live capture"
             )
+            if alerts is not None:
+                alerts.note_recovered(device_id)
             backoff = 5
+            failures = 0
 
-            for attendance in conn.live_capture():
+            for attendance in conn.live_capture(new_timeout=10):
+                if stopping["flag"]:
+                    break
                 if attendance is None:
+                    if _orphaned():
+                        break
                     continue
                 record = _record_from_zk(attendance, device_id)
                 if record is None:
@@ -835,19 +992,23 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
                     sub_logger.error(
                         f"❌ [device {device_id}] enqueue failed: {exc}"
                     )
+            if not stopping["flag"] and not _orphaned():
+                raise ConnectionError("live capture stream ended")
         except Exception as exc:
+            failures += 1
+            reason = str(exc) or type(exc).__name__
             sub_logger.error(
-                f"❌ [device {device_id}] capture error: {exc}; "
-                f"reconnecting in {backoff}s"
+                f"❌ [device {device_id}] capture error: [{transport}] "
+                f"{reason}; reconnecting in {backoff}s"
             )
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 120)
+            _zk_close(conn)
+            conn = None
+            deadline = time.time() + backoff
+            while time.time() < deadline and not _orphaned():
+                time.sleep(1)
+            backoff = min(backoff * 2, CAPTURE_MAX_BACKOFF_S)
         finally:
-            if conn is not None:
-                try:
-                    conn.disconnect()
-                except Exception:
-                    pass
+            _zk_close(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -858,28 +1019,23 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
     device_id = device.get("device_id", "?")
     ip = device.get("ip_address", "?")
     port = int(device.get("port", 4370) or 4370)
-    pwd = _safe_password(device)
+    preferred_udp = bool(device.get("force_udp", False))
 
     logger.info(f"🧹 [device {device_id}] EoD pull from {ip}:{port}")
-    zk = ZK(
-        ip,
-        port=port,
-        timeout=100,
-        password=pwd,
-        force_udp=False,
-        ommit_ping=False,
-    )
-    conn = zk.connect()
-    if not conn:
-        raise RuntimeError("connect() returned None")
+    try:
+        conn = _zk_open(device, force_udp=preferred_udp, io_timeout=100)
+    except DeviceConnectError as exc:
+        logger.warning(
+            f"⚠️ [device {device_id}] history pull "
+            f"{'UDP' if preferred_udp else 'TCP'} connect failed ({exc}); "
+            f"retrying over {'TCP' if preferred_udp else 'UDP'}"
+        )
+        conn = _zk_open(device, force_udp=not preferred_udp, io_timeout=100)
     try:
         conn.enable_device()
         logs = conn.get_attendance() or []
     finally:
-        try:
-            conn.disconnect()
-        except Exception:
-            pass
+        _zk_close(conn)
 
     if not logs:
         logger.info(f"ℹ️ [device {device_id}] No logs found")
@@ -973,6 +1129,22 @@ def end_of_day_task(
         kind_start = "eod_start"
         kind_done = "eod_done"
 
+    if is_manual_backfill_active(DB_PATH):
+        logger.info(
+            f"⏭️ {label} deferred — a manual device backfill is running"
+        )
+        return False
+
+    # Boot may already hold this flag (set before the thread starts so
+    # morning/EoD cannot race it). Any other job must wait.
+    already_pulling = _history_pull_active.is_set()
+    if already_pulling and not is_boot:
+        logger.info(
+            f"⏭️ {label} deferred — another history pull is already running"
+        )
+        return False
+
+    _history_pull_active.set()
     logger.info(
         f"{emoji} {label} start (lookback={lookback}d, "
         f"dates={sorted(target_dates)[0]} … {sorted(target_dates)[-1]})"
@@ -991,8 +1163,6 @@ def end_of_day_task(
     ok = 0
     fail = 0
     total_new = 0
-    already_pulling = _history_pull_active.is_set()
-    _history_pull_active.set()
     try:
         for d in DEVICES:
             if stop_event is not None and stop_event.is_set():
@@ -1053,6 +1223,75 @@ def end_of_day_task(
 # Process supervisor / watchdog
 # ---------------------------------------------------------------------------
 
+def _stop_process(p: Process, timeout: float = 5.0) -> None:
+    try:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=timeout)
+        if p.is_alive():
+            logger.warning(
+                f"🔪 {p.name} (PID {p.pid}) ignored SIGTERM; killing"
+            )
+            p.kill()
+            p.join(timeout=3)
+    except Exception:
+        pass
+
+
+def kill_stale_workers() -> int:
+    """Kill leftover daemon/worker processes from earlier runs.
+
+    Older builds leaked capture workers on every restart; each one still
+    holds an SDK session, and terminals with few slots then stop answering
+    new connections even though ping works.
+    """
+    try:
+        import psutil
+    except ImportError:
+        logger.warning("psutil missing; cannot clean up stale capture workers")
+        return 0
+    try:
+        me = psutil.Process()
+        my_cmd = me.cmdline()
+        my_cwd = me.cwd()
+        skip = {me.pid} | {p.pid for p in me.parents()}
+    except Exception:
+        return 0
+    victims = []
+    for p in psutil.process_iter(["pid", "cmdline", "cwd"]):
+        try:
+            if p.pid in skip or p.info["cwd"] != my_cwd:
+                continue
+            cmd = p.info["cmdline"] or []
+            # fork children share our argv; spawn/forkserver children run
+            # "python -c 'from multiprocessing...'" from the same cwd.
+            if cmd == my_cmd or (
+                cmd and cmd[0] == my_cmd[0] and "multiprocessing" in " ".join(cmd)
+            ):
+                victims.append(p)
+        except Exception:
+            continue
+    if not victims:
+        return 0
+    logger.warning(
+        f"🧟 Found {len(victims)} stale attendance process(es) from a previous "
+        f"run holding device sessions: {[p.pid for p in victims]}; stopping them"
+    )
+    for p in victims:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    _gone, alive = psutil.wait_procs(victims, timeout=5)
+    for p in alive:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    psutil.wait_procs(alive, timeout=3)
+    return len(victims)
+
+
 def spawn_capture_process(device: dict) -> Process:
     p = Process(
         target=capture_real_time_logs,
@@ -1078,11 +1317,7 @@ def _pause_capture_device(processes: Dict[Any, Process], device: dict) -> None:
     if p is None:
         return
     logger.info(f"⏸️ Pausing live capture on device {did} for history pull")
-    try:
-        p.terminate()
-        p.join(timeout=5)
-    except Exception:
-        pass
+    _stop_process(p)
 
 
 def _resume_capture_device(processes: Dict[Any, Process], device: dict) -> None:
@@ -1111,6 +1346,12 @@ def _pull_one_device_history(
     try:
         return _eod_one_device(device, target_dates)
     except Exception as first_exc:
+        if is_sqlite_corruption_error(first_exc):
+            if not _repair_queue_if_corrupt(
+                f"history pull device {device.get('device_id')}"
+            ):
+                raise
+            return _eod_one_device(device, target_dates)
         if processes is None:
             raise
         logger.warning(
@@ -1150,11 +1391,7 @@ def supervise_processes(processes: Dict[Any, Process]) -> None:
                     kind=f"worker_restart_{did}",
                     min_interval_s=300,
                 )
-                try:
-                    p.terminate()
-                    p.join(timeout=5)
-                except Exception:
-                    pass
+                _stop_process(p)
             try:
                 with _processes_lock:
                     processes[did] = spawn_capture_process(d)
@@ -1175,11 +1412,14 @@ def stop_processes(
             p.terminate()
         except Exception:
             pass
+    deadline = time.time() + timeout
     for _did, p in items:
         try:
-            p.join(timeout=timeout)
+            p.join(timeout=max(0.1, deadline - time.time()))
         except Exception:
             pass
+    for _did, p in items:
+        _stop_process(p, timeout=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +1436,23 @@ def maybe_run_boot_recovery(
     Safe to run in a background thread alongside live capture. Per-device
     pull will pause only the terminal that needs a free SDK session.
     """
+    global _queue_db_needs_extended_recovery
+    _history_pull_active.set()
+    try:
+        _run_boot_recovery(
+            force_extended=force_extended,
+            processes=processes,
+            stop_event=stop_event,
+        )
+    finally:
+        _history_pull_active.clear()
+
+
+def _run_boot_recovery(
+    force_extended: bool = False,
+    processes: Optional[Dict[Any, Process]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
     global _queue_db_needs_extended_recovery
     lookback = BOOT_SYNC_DAYS
     if force_extended or _queue_db_needs_extended_recovery:
@@ -1250,6 +1507,7 @@ def maybe_run_boot_recovery(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    kill_stale_workers()
     logger.info("🚀 Boot checks: waiting for network...")
     if not wait_for_network(120):
         logger.warning("Network/DNS not ready after 120s; continuing anyway")
@@ -1297,6 +1555,7 @@ def main() -> None:
         f"{retain_line}",
         kind="boot",
     )
+    announce_error_alerts(error_alert_handler)
 
     stop_event = threading.Event()
 
@@ -1328,6 +1587,9 @@ def main() -> None:
         name="boot-sync",
         daemon=True,
     )
+    # Hold the history-pull lock before the thread is scheduled so the
+    # main loop cannot start morning/EoD on the same devices.
+    _history_pull_active.set()
     boot_sync.start()
     logger.info("🟢 Live capture is running; 60-day boot sync is in background")
 
@@ -1466,11 +1728,11 @@ def main() -> None:
     finally:
         logger.info("🛑 Stopping...")
         stop_event.set()
+        stop_processes(processes)
         try:
             pusher.join(timeout=10)
         except Exception:
             pass
-        stop_processes(processes)
         try:
             stats = queue.stats()
         except Exception:

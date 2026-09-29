@@ -33,7 +33,12 @@ from typing import Iterable, List, Optional
 import httpx
 from zk import ZK
 
-from storage import DEFAULT_DB_PATH, AttendanceQueue, ensure_sqlite_queue_db
+from storage import (
+    DEFAULT_DB_PATH,
+    AttendanceQueue,
+    ensure_sqlite_queue_db,
+    is_sqlite_corruption_error,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +502,13 @@ def main() -> int:
             progress(f"   · Logbook pending now : {pending_now:,}")
             devices_ok += 1
         except Exception as exc:
-            logging.error(f"[{dev_id}] enqueue failed: {exc}")
+            if is_sqlite_corruption_error(exc):
+                logging.error(
+                    f"[{dev_id}] enqueue failed ({exc}); "
+                    "queue auto-repair already attempted"
+                )
+            else:
+                logging.error(f"[{dev_id}] enqueue failed: {exc}")
             progress(f"   ✗ FAILED — could not save to logbook: {exc}")
             overall_ok = False
             devices_failed += 1

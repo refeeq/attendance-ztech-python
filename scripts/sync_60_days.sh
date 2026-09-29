@@ -35,12 +35,17 @@ YELLOW=$'\e[33m'
 BOLD=$'\e[1m'
 RESET=$'\e[0m'
 PM2_TAIL_PID=""
+BACKFILL_LOCK=""
 
 cleanup_background_jobs() {
     if [[ -n "${PM2_TAIL_PID:-}" ]]; then
         kill "$PM2_TAIL_PID" >/dev/null 2>&1 || true
         wait "$PM2_TAIL_PID" >/dev/null 2>&1 || true
         PM2_TAIL_PID=""
+    fi
+    if [[ -n "${BACKFILL_LOCK:-}" ]]; then
+        rm -f "$BACKFILL_LOCK"
+        BACKFILL_LOCK=""
     fi
 }
 
@@ -157,6 +162,13 @@ case "$ANSWER" in
     y|Y|yes|YES) ;;
     *) echo "${YELLOW}Cancelled.${RESET}"; pause_and_exit 0 ;;
 esac
+
+# Tell the PM2 daemon not to start a morning/EoD/boot history pull while
+# this script is already downloading from the same devices (that overlap
+# corrupts the SQLite logbook and breaks ZKTeco sessions).
+BACKFILL_LOCK="$PROJECT_DIR/data/.manual_backfill.lock"
+mkdir -p "$PROJECT_DIR/data"
+touch "$BACKFILL_LOCK"
 
 echo
 echo "${BOLD}Starting sync...${RESET}"
