@@ -50,6 +50,43 @@ _CORRUPT_RE = re.compile(
 )
 
 
+# Forking while this process has a SQLite connection open copies SQLite's
+# in-memory lock bookkeeping into the child. The child then believes it holds
+# locks it does not and can write concurrently with other processes, which
+# corrupts the file (sqlite.org/howtocorrupt.html, "across a fork()"). The
+# daemon forks capture workers while the pusher thread is mid-query, so every
+# connection is opened under this lock and os.fork() waits for it.
+_db_fork_lock = threading.RLock()
+
+
+def _before_fork() -> None:
+    _db_fork_lock.acquire()
+
+
+def _after_fork_parent() -> None:
+    _db_fork_lock.release()
+
+
+def _after_fork_child() -> None:
+    global _db_fork_lock
+    _db_fork_lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_parent,
+        after_in_child=_after_fork_child,
+    )
+
+
+@contextmanager
+def _fork_safe():
+    lock = _db_fork_lock
+    with lock:
+        yield
+
+
 def is_sqlite_corruption_error(exc: BaseException) -> bool:
     """True when ``exc`` looks like SQLite file corruption."""
     return bool(_CORRUPT_RE.search(str(exc)))
@@ -135,20 +172,21 @@ def verify_sqlite_queue_db(db_path: str) -> tuple[bool, str]:
     path = Path(str(db_path)).expanduser()
     if not path.is_file():
         return True, "ok"
-    try:
-        uri = path.resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=15.0)
-    except sqlite3.Error as exc:
-        return False, str(exc)
-    try:
-        rows = list(conn.execute("PRAGMA quick_check;"))
-    except sqlite3.Error as exc:
-        return False, str(exc)
-    finally:
+    with _fork_safe():
         try:
-            conn.close()
-        except Exception:
-            pass
+            uri = path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=15.0)
+        except sqlite3.Error as exc:
+            return False, str(exc)
+        try:
+            rows = list(conn.execute("PRAGMA quick_check;"))
+        except sqlite3.Error as exc:
+            return False, str(exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
     if not rows:
         return False, "PRAGMA quick_check returned no rows"
     messages = [str(r[0]) for r in rows]
@@ -163,14 +201,15 @@ def checkpoint_wal(db_path: str, truncate: bool = True) -> None:
     path = _resolve_db_path(db_path)
     if not path.is_file():
         return
-    conn = sqlite3.connect(str(path), timeout=30.0)
-    try:
-        conn.execute(f"PRAGMA wal_checkpoint({mode});")
-    finally:
+    with _fork_safe():
+        conn = sqlite3.connect(str(path), timeout=30.0)
         try:
-            conn.close()
-        except Exception:
-            pass
+            conn.execute(f"PRAGMA wal_checkpoint({mode});")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _quarantine_db_files(db_path: str, label: str) -> Path:
@@ -408,7 +447,7 @@ class AttendanceQueue:
 
     @contextmanager
     def _conn(self):
-        with self._lock:
+        with self._lock, _fork_safe():
             conn = _open_connection(self.db_path)
             try:
                 yield conn

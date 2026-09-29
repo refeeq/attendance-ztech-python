@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from zk import ZK
 from zk.base import ZK_helper
+from zk.exception import ZKErrorResponse
 
 from storage import (
     DEFAULT_DB_PATH,
@@ -712,7 +713,29 @@ def _zk_open(
             _enable_keepalive(sock)
         sock.settimeout(io_timeout)
     conn._ZK__timeout = io_timeout
+    _make_free_data_tolerant(conn)
     return conn
+
+
+def _make_free_data_tolerant(conn: Any) -> None:
+    """Don't discard a completed download because CMD_FREE_DATA was misread.
+
+    pyzk calls free_data() only after every chunk has been received and
+    validated. On TCP its "broken ACK" reassembly can leave that reply
+    misaligned, and pyzk then raises "can't free data" and throws the
+    whole transfer away. The terminal releases the buffer on disconnect
+    anyway; if the stream really is out of sync the next command fails
+    and the caller retries on a fresh connection.
+    """
+    original = conn.free_data
+
+    def free_data() -> bool:
+        try:
+            return original()
+        except ZKErrorResponse:
+            return False
+
+    conn.free_data = free_data
 
 
 # ---------------------------------------------------------------------------
@@ -997,16 +1020,27 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
         except Exception as exc:
             failures += 1
             reason = str(exc) or type(exc).__name__
-            sub_logger.error(
-                f"❌ [device {device_id}] capture error: [{transport}] "
-                f"{reason}; reconnecting in {backoff}s"
-            )
+            # A single blip (e.g. the terminal still busy right after a
+            # history pull closed its session) is retried quickly and not
+            # alerted; only a repeat failure is reported as an error.
+            if failures == 1:
+                wait_s = 2
+                sub_logger.warning(
+                    f"⚠️ [device {device_id}] capture hiccup: [{transport}] "
+                    f"{reason}; retrying in {wait_s}s"
+                )
+            else:
+                wait_s = backoff
+                backoff = min(backoff * 2, CAPTURE_MAX_BACKOFF_S)
+                sub_logger.error(
+                    f"❌ [device {device_id}] capture error: [{transport}] "
+                    f"{reason}; reconnecting in {wait_s}s"
+                )
             _zk_close(conn)
             conn = None
-            deadline = time.time() + backoff
+            deadline = time.time() + wait_s
             while time.time() < deadline and not _orphaned():
                 time.sleep(1)
-            backoff = min(backoff * 2, CAPTURE_MAX_BACKOFF_S)
         finally:
             _zk_close(conn)
 
@@ -1022,20 +1056,29 @@ def _eod_one_device(device: dict, target_dates: set) -> int:
     preferred_udp = bool(device.get("force_udp", False))
 
     logger.info(f"🧹 [device {device_id}] EoD pull from {ip}:{port}")
-    try:
-        conn = _zk_open(device, force_udp=preferred_udp, io_timeout=100)
-    except DeviceConnectError as exc:
-        logger.warning(
-            f"⚠️ [device {device_id}] history pull "
-            f"{'UDP' if preferred_udp else 'TCP'} connect failed ({exc}); "
-            f"retrying over {'TCP' if preferred_udp else 'UDP'}"
-        )
-        conn = _zk_open(device, force_udp=not preferred_udp, io_timeout=100)
-    try:
-        conn.enable_device()
-        logs = conn.get_attendance() or []
-    finally:
-        _zk_close(conn)
+    # UDP transfers in small datagrams and avoids the TCP chunk
+    # reassembly that most often breaks, so it is the last resort.
+    attempts = (preferred_udp, preferred_udp, not preferred_udp)
+    logs: List[Any] = []
+    for n, use_udp in enumerate(attempts, 1):
+        transport = "UDP" if use_udp else "TCP"
+        conn = None
+        try:
+            conn = _zk_open(device, force_udp=use_udp, io_timeout=100)
+            conn.enable_device()
+            logs = conn.get_attendance() or []
+            break
+        except Exception as exc:
+            if n == len(attempts):
+                raise
+            logger.warning(
+                f"⚠️ [device {device_id}] history pull attempt {n}/"
+                f"{len(attempts)} over {transport} failed ({exc}); "
+                f"retrying on a fresh connection"
+            )
+        finally:
+            _zk_close(conn)
+        time.sleep(3)
 
     if not logs:
         logger.info(f"ℹ️ [device {device_id}] No logs found")
