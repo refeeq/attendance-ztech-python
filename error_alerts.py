@@ -17,6 +17,7 @@ import html
 import logging
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -150,6 +151,7 @@ class ErrorAlertHandler(logging.Handler):
         super().__init__(level=logging.INFO)
         self._notifier = notifier
         self.system_name = system_name or "Attendance"
+        self.hostname = socket.gethostname()
         self._ips = _device_ips(devices)
         self.repeat_after_s = max(60, int(repeat_after_s or 600))
         self._sync = sync
@@ -190,7 +192,7 @@ class ErrorAlertHandler(logging.Handler):
                 st["open"] = False
                 st["inflight"] = True
                 st["suppressed"] = 0
-                body = [datetime.now().strftime("%H:%M:%S")]
+                body = [f"When: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
                 if since:
                     body.append(f"It had been down since {since}.")
                 body.append("Live punches are being recorded again.")
@@ -255,7 +257,7 @@ class ErrorAlertHandler(logging.Handler):
         if not key:
             return None, None
         now = time.monotonic()
-        clock = datetime.now().strftime("%H:%M:%S")
+        clock = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
             st = self._state.get(key)
             if st and st.get("inflight"):
@@ -271,7 +273,7 @@ class ErrorAlertHandler(logging.Handler):
                     "opened_at": clock,
                     "last_text": detail,
                 }
-                return self._html(title, [clock, detail]), key
+                return self._html(title, [f"When: {clock}", f"Error: {detail}"]), key
 
             wait = int(st.get("retry_in") or self.repeat_after_s)
             elapsed = now - float(st.get("last_sent") or 0)
@@ -284,7 +286,11 @@ class ErrorAlertHandler(logging.Handler):
             since = st.get("opened_at") or ""
             st["suppressed"] = 0
             st["inflight"] = True
-            lines = [f"{extra} more since {since}".strip(), f"Latest: {detail}"]
+            lines = [
+                f"When: {clock}",
+                f"{extra} more since {since}".strip(),
+                f"Latest: {detail}",
+            ]
             return self._html(f"{title} — still failing", lines), key
 
     def _classify(
@@ -392,8 +398,9 @@ class ErrorAlertHandler(logging.Handler):
         mark = "✅" if ok else "❌"
         body = "\n".join(html.escape(line) for line in lines if line)
         return (
-            f"{mark} <b>{html.escape(self.system_name)}</b>\n"
-            f"<b>{html.escape(title)}</b>\n"
+            f"{mark} <b>{html.escape(title)}</b>\n"
+            f"🏫 <b>School:</b> {html.escape(self.system_name)}\n"
+            f"🖥 <b>Server:</b> {html.escape(self.hostname)}\n"
             f"{body}"
         )
 
@@ -503,6 +510,9 @@ def _self_check() -> None:
     assert len(sent) == 1, sent
     assert "10.30.141.5" in sent[0]
     assert "timed out" in sent[0]
+    assert "School:" in sent[0] and "PACE_ATTENDANCE" in sent[0]
+    assert "Server:" in sent[0] and handler.hostname in sent[0]
+    assert "When:" in sent[0] and "Error:" in sent[0]
     emit(
         logging.ERROR,
         "❌ [device 3] capture error: timed out; reconnecting in 5s",
