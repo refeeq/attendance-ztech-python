@@ -21,7 +21,11 @@ Pipeline
    so late-arrival data is on the ERP when staff need it. Runs once per
    day; if the daemon was down at 08:00 it catch-up runs after it returns.
    After enqueue it waits for the pusher to drain pending rows.
-6. On every daemon start live capture begins immediately. A background
+6. About every 4 minutes each terminal's own clock is read and reported to
+   the ERP heartbeat (``empAttDeviceSync.php``). The ping is sent only after
+   every queued punch at or before that clock time has been pushed, so a
+   report of 07:15:00 never goes out while a 07:11:00 punch is still waiting.
+7. On every daemon start live capture begins immediately. A background
    thread then pulls ``boot_sync_days`` (default 60) of history into the
    queue; the pusher drains those rows to the ERP without blocking punches.
    The legacy ``boot_sync_30d.py`` oneshot still exists for systemd/cron.
@@ -49,7 +53,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from zk import ZK
+from zk import ZK, const as zk_const
 from zk.base import ZK_helper
 from zk.exception import ZKErrorResponse
 
@@ -202,6 +206,14 @@ CAPTURE_MAX_BACKOFF_S = max(5, int(_SYNC_CFG.get("capture_max_backoff_s", 60)))
 OUTAGE_CATCHUP_MIN_S = max(10, int(_SYNC_CFG.get("outage_catchup_min_s", 60)))
 OUTAGE_CATCHUP_RETRY_S = max(60, int(_SYNC_CFG.get("outage_catchup_retry_s", 600)))
 CATCHUP_STATE_PREFIX = "catchup_from:"
+# Capture workers publish the terminal clock here when the heartbeat asks.
+HB_REQ_PREFIX = "hb_req:"
+HB_CLOCK_PREFIX = "hb_clock:"
+# HR dashboard: Online = ping within 5 min, Lagging = 5–10, Offline = 10+.
+# Default 240s leaves time to read the clock and push punches first.
+_RAW_HEARTBEAT_S = int(_SYNC_CFG.get("device_heartbeat_s", 240))
+DEVICE_HEARTBEAT_S = 0 if _RAW_HEARTBEAT_S <= 0 else max(60, _RAW_HEARTBEAT_S)
+_EF_ATTLOG = int(getattr(zk_const, "EF_ATTLOG", 1))
 EOD_LOOKBACK_DAYS    = max(1,  int(_SYNC_CFG.get("eod_lookback_days", 1)))
 MORNING_SYNC_HOUR = max(0, min(23, int(_SYNC_CFG.get("morning_sync_hour", 8))))
 MORNING_SYNC_MINUTE = max(
@@ -243,6 +255,24 @@ DB_INTEGRITY_CHECK_INTERVAL_S = max(
 )
 DB_PATH              = str(_SYNC_CFG.get("db_path", DEFAULT_DB_PATH))
 
+
+def _device_sync_endpoint(attendance_endpoint: str) -> str:
+    """Heartbeat URL. Override with config ``device_sync_endpoint``."""
+    explicit = str(config.get("device_sync_endpoint") or "").strip()
+    if explicit:
+        return explicit
+    endpoint = attendance_endpoint.rstrip("/")
+    marker = "empAttSync.php"
+    if endpoint.endswith(marker):
+        return endpoint[: -len(marker)] + "empAttDeviceSync.php"
+    base, sep, _name = endpoint.rpartition("/")
+    if not sep:
+        return endpoint
+    return f"{base}/empAttDeviceSync.php"
+
+
+DEVICE_SYNC_ENDPOINT = _device_sync_endpoint(ENDPOINT)
+
 if not ENDPOINT:
     logger.error("config.json missing 'endpoint'. Refusing to start.")
     sys.exit(1)
@@ -274,6 +304,8 @@ logger.info(
     f"boot_sync_days={BOOT_SYNC_DAYS} eod_lookback_days={EOD_LOOKBACK_DAYS} "
     f"morning_sync={MORNING_SYNC_HOUR:02d}:{MORNING_SYNC_MINUTE:02d} "
     f"retention={_retention} purge={_purge_every} "
+    f"heartbeat={'OFF' if DEVICE_HEARTBEAT_S <= 0 else str(DEVICE_HEARTBEAT_S) + 's'} "
+    f"heartbeat_url={DEVICE_SYNC_ENDPOINT} "
     f"telegram={'ON' if telegram_notifier.enabled else 'OFF'}"
 )
 
@@ -785,6 +817,11 @@ def push_with_retries(
     return False, last_err
 
 
+# Held from "read unsynced rows" through "mark them synced" so the pusher
+# and the device heartbeat cannot POST the same punch twice.
+_erp_push_lock = threading.Lock()
+
+
 def pusher_loop(stop_event: threading.Event) -> None:
     """Drain the queue to the ERP. Runs as a daemon thread in main process."""
     logger.info("📤 Pusher thread started")
@@ -823,43 +860,59 @@ def pusher_loop(stop_event: threading.Event) -> None:
 
             last_push_attempt = now
 
-            try:
-                records = queue.fetch_unsynced(PUSH_BATCH_SIZE)
-            except Exception as exc:
-                logger.error(f"Pusher: fetch_unsynced failed: {exc}")
-                if is_sqlite_corruption_error(exc):
-                    _repair_queue_if_corrupt("pusher fetch_unsynced")
+            records = None
+            ids: List[int] = []
+            ok = False
+            err: Optional[str] = None
+            retry_soon = False
+            with _erp_push_lock:
+                try:
+                    records = queue.fetch_unsynced(PUSH_BATCH_SIZE)
+                except Exception as exc:
+                    logger.error(f"Pusher: fetch_unsynced failed: {exc}")
+                    if is_sqlite_corruption_error(exc):
+                        _repair_queue_if_corrupt("pusher fetch_unsynced")
+                    retry_soon = True
+                    records = None
+                if records:
+                    ids = [r["id"] for r in records]
+                    payload = [
+                        {
+                            "device_id": r["device_id"],
+                            "user_id": r["user_id"],
+                            "timestamp": r["timestamp"],
+                            "status": r["status"],
+                            "punch": r["punch"],
+                        }
+                        for r in records
+                    ]
+                    ok, err = push_with_retries(payload)
+                    if ok:
+                        try:
+                            queue.mark_synced(ids)
+                        except Exception as exc:
+                            logger.error(
+                                f"Pusher: mark_synced failed (will retry): {exc}"
+                            )
+                            if is_sqlite_corruption_error(exc):
+                                _repair_queue_if_corrupt("pusher mark_synced")
+                            retry_soon = True
+                            records = None
+                    else:
+                        try:
+                            queue.mark_attempt_failed(ids, str(err))
+                        except Exception as exc2:
+                            logger.error(
+                                f"Pusher: mark_attempt_failed error: {exc2}"
+                            )
+
+            if retry_soon:
                 stop_event.wait(timeout=5)
                 continue
-
             if not records:
                 continue
 
-            ids = [r["id"] for r in records]
-            payload = [
-                {
-                    "device_id": r["device_id"],
-                    "user_id": r["user_id"],
-                    "timestamp": r["timestamp"],
-                    "status": r["status"],
-                    "punch": r["punch"],
-                }
-                for r in records
-            ]
-
-            ok, err = push_with_retries(payload)
             if ok:
-                try:
-                    queue.mark_synced(ids)
-                except Exception as exc:
-                    logger.error(
-                        f"Pusher: mark_synced failed (will retry): {exc}"
-                    )
-                    if is_sqlite_corruption_error(exc):
-                        _repair_queue_if_corrupt("pusher mark_synced")
-                    stop_event.wait(timeout=5)
-                    continue
-
                 logger.info(
                     f"✅ Synced {len(ids)} records "
                     f"(pending after: {max(0, pending - len(ids))})"
@@ -892,10 +945,6 @@ def pusher_loop(stop_event: threading.Event) -> None:
                             min_interval_s=TG_DATA_PUSH_PROGRESS_INTERVAL_S,
                         )
             else:
-                try:
-                    queue.mark_attempt_failed(ids, str(err))
-                except Exception as exc2:
-                    logger.error(f"Pusher: mark_attempt_failed error: {exc2}")
                 consecutive_failures += 1
                 logger.error(
                     f"❌ Sync failed (attempt #{consecutive_failures}, "
@@ -924,6 +973,380 @@ def pusher_loop(stop_event: threading.Event) -> None:
             stop_event.wait(timeout=5)
 
     logger.info("📤 Pusher thread stopped")
+
+
+# ---------------------------------------------------------------------------
+# Device heartbeat (empAttDeviceSync.php)
+# ---------------------------------------------------------------------------
+
+def _request_device_clock(
+    device_id: int, stop_event: threading.Event
+) -> Optional[str]:
+    """Ask the capture worker for the terminal clock. ``YYYY-MM-DD HH:MM:SS``."""
+    token = f"{time.time():.6f}-{device_id}"
+    key_req = f"{HB_REQ_PREFIX}{device_id}"
+    key_clock = f"{HB_CLOCK_PREFIX}{device_id}"
+    try:
+        queue.set_state(key_req, token)
+    except Exception as exc:
+        logger.warning(
+            f"⚠️ [device {device_id}] could not ask for the terminal clock: {exc}"
+        )
+        return None
+    deadline = time.time() + 45
+    try:
+        while time.time() < deadline and not stop_event.is_set():
+            try:
+                raw = queue.get_state(key_clock) or ""
+            except Exception as exc:
+                logger.warning(
+                    f"⚠️ [device {device_id}] could not read the terminal clock: {exc}"
+                )
+                return None
+            served, sep, stamp = raw.partition("|")
+            if sep and served == token:
+                try:
+                    datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    logger.warning(
+                        f"⚠️ [device {device_id}] terminal clock {stamp!r} "
+                        f"is not Y-m-d H:i:s"
+                    )
+                    return None
+                return stamp
+            stop_event.wait(0.5)
+        return None
+    finally:
+        try:
+            queue.set_state(key_req, "")
+        except Exception:
+            pass
+
+
+def _publish_device_clock_if_requested(
+    conn: Any,
+    local_queue: AttendanceQueue,
+    device_id: Any,
+    served: Dict[str, str],
+    log: logging.Logger,
+) -> None:
+    """On an idle live-capture tick, answer a pending clock request.
+
+    ``get_time`` runs on the capture socket between punches. Real-time
+    events are registered again afterwards so the stream keeps going.
+    A failure raises ``ConnectionError`` and the worker reconnects.
+    """
+    try:
+        req = local_queue.get_state(f"{HB_REQ_PREFIX}{device_id}") or ""
+    except Exception as exc:
+        log.warning(
+            f"⚠️ [device {device_id}] clock request read failed: {exc}"
+        )
+        return
+    req = str(req).strip()
+    if not req or req == served.get("token"):
+        return
+    try:
+        machine_dt = conn.get_time()
+        if not isinstance(machine_dt, datetime):
+            raise RuntimeError(f"device returned {machine_dt!r}")
+        stamp = machine_dt.strftime("%Y-%m-%d %H:%M:%S")
+        datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        local_queue.set_state(
+            f"{HB_CLOCK_PREFIX}{device_id}", f"{req}|{stamp}"
+        )
+        served["token"] = req
+        log.info(f"HEARTBEAT device {device_id} ZKTeco clock {stamp}")
+        conn.reg_event(_EF_ATTLOG)
+    except Exception as exc:
+        raise ConnectionError(f"device clock read failed: {exc}") from exc
+
+
+def _push_through_batch(
+    device_id: int, through_ts: str
+) -> Tuple[str, int, Optional[str]]:
+    """Push one batch of punches at or before ``through_ts``.
+
+    Caller holds ``_erp_push_lock``. Returns ``(status, count, error)``
+    where status is ``empty``, ``ok``, or ``fail``.
+    """
+    try:
+        rows = queue.fetch_unsynced_through(
+            device_id, through_ts, PUSH_BATCH_SIZE
+        )
+    except Exception as exc:
+        if is_sqlite_corruption_error(exc):
+            _repair_queue_if_corrupt("heartbeat fetch_unsynced_through")
+        return "fail", 0, str(exc)
+    if not rows:
+        return "empty", 0, None
+    ids = [int(r["id"]) for r in rows]
+    payload = [
+        {
+            "device_id": r["device_id"],
+            "user_id": r["user_id"],
+            "timestamp": r["timestamp"],
+            "status": r["status"],
+            "punch": r["punch"],
+        }
+        for r in rows
+    ]
+    ok, err = push_with_retries(payload)
+    if not ok:
+        try:
+            queue.mark_attempt_failed(ids, str(err))
+        except Exception as exc:
+            logger.error(f"Heartbeat: mark_attempt_failed error: {exc}")
+        return "fail", len(rows), err
+    try:
+        queue.mark_synced(ids)
+    except Exception as exc:
+        if is_sqlite_corruption_error(exc):
+            _repair_queue_if_corrupt("heartbeat mark_synced")
+        return "fail", len(rows), f"mark_synced failed: {exc}"
+    first = str(rows[0].get("timestamp") or "(blank)")
+    last = str(rows[-1].get("timestamp") or "(blank)")
+    logger.info(
+        f"HEARTBEAT device {device_id} pushed {len(rows)} punch(es) "
+        f"at or before {through_ts} ({first} .. {last})"
+    )
+    return "ok", len(rows), None
+
+
+def _post_device_heartbeat(
+    device_id: int, ip: str, machine_time: str
+) -> Tuple[bool, str]:
+    """POST the terminal clock. Retries transport and HTTP 5xx only."""
+    body: Dict[str, str] = {
+        "device_id": str(device_id)[:64],
+        "machine_time": machine_time,
+    }
+    if ip:
+        body["ip"] = ip[:45]
+    logger.info(
+        f"HEARTBEAT device {device_id} POST {DEVICE_SYNC_ENDPOINT} "
+        f"body={json.dumps(body, ensure_ascii=False)}"
+    )
+    delay = 2
+    last = "no attempt"
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=PUSH_TIMEOUT_S) as client:
+                resp = client.post(
+                    DEVICE_SYNC_ENDPOINT,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                )
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                f"HEARTBEAT device {device_id} POST failed "
+                f"(attempt {attempt}/3): {exc}"
+            )
+            if attempt < 3:
+                time.sleep(delay)
+            continue
+        text = (resp.text or "")[:500]
+        logger.info(
+            f"HEARTBEAT device {device_id} response "
+            f"HTTP {resp.status_code} {text}"
+        )
+        if resp.status_code >= 500 or resp.status_code == 429:
+            last = f"HTTP {resp.status_code}: {text}"
+            logger.warning(
+                f"HEARTBEAT device {device_id} POST failed "
+                f"(attempt {attempt}/3): {last}"
+            )
+            if attempt < 3:
+                time.sleep(delay)
+            continue
+        if not (200 <= resp.status_code < 300):
+            return False, f"HTTP {resp.status_code}: {text}"
+        try:
+            payload = resp.json()
+        except Exception:
+            return False, f"Non-JSON response: {text}"
+        if isinstance(payload, dict) and payload.get("status") is True:
+            return True, ""
+        message = ""
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or "")
+        return False, message or text
+    return False, last
+
+
+def _history_blocks_heartbeat() -> bool:
+    return _history_pull_active.is_set() or is_manual_backfill_active(DB_PATH)
+
+
+def _heartbeat_one_device(device: dict, stop_event: threading.Event) -> None:
+    """Push punches at or before the terminal clock, then report that clock.
+
+    The time sent to the ERP is the ZKTeco clock, not the PC clock. A report
+    of 07:15:00 is sent only when no queued punch at 07:15:00 or earlier is
+    still waiting. Punches that happen after that clock stay for the pusher.
+    """
+    raw_id = device.get("device_id")
+    try:
+        device_id = int(raw_id)
+    except (TypeError, ValueError):
+        logger.error(f"HEARTBEAT skipped; bad device_id {raw_id!r}")
+        return
+    ip = str(device.get("ip_address") or "").strip()
+    with _paused_lock:
+        paused = raw_id in _paused_device_ids or device_id in _paused_device_ids
+    if paused:
+        logger.info(
+            f"HEARTBEAT device {device_id} skipped; capture is paused"
+        )
+        return
+    if _history_blocks_heartbeat():
+        return
+
+    machine_time = _request_device_clock(device_id, stop_event)
+    if stop_event.is_set():
+        return
+    if not machine_time:
+        logger.warning(
+            f"HEARTBEAT device {device_id} clock not read within 45s; "
+            f"heartbeat not sent"
+        )
+        return
+    # A punch packet already on the wire can land just after the clock read.
+    if stop_event.wait(1.0):
+        return
+    if _history_blocks_heartbeat():
+        logger.info(
+            f"HEARTBEAT device {device_id} cancelled; a history pull started"
+        )
+        return
+
+    try:
+        pending_before = queue.count_unsynced_through(device_id, machine_time)
+    except Exception as exc:
+        logger.error(
+            f"HEARTBEAT device {device_id} count failed: {exc}"
+        )
+        return
+    logger.info(
+        f"HEARTBEAT device {device_id} clock={machine_time} "
+        f"ip={ip or '-'} pending_at_or_before={pending_before}"
+    )
+
+    while not stop_event.is_set():
+        with _erp_push_lock:
+            status, count, err = _push_through_batch(device_id, machine_time)
+        if status == "empty":
+            break
+        if status == "fail":
+            logger.error(
+                f"❌ Sync failed (device {device_id} heartbeat, "
+                f"through {machine_time}): {err}"
+            )
+            logger.warning(
+                f"HEARTBEAT device {device_id} held at {machine_time}; "
+                f"punches at or before that time are still not on the ERP"
+            )
+            return
+
+    if stop_event.is_set():
+        return
+
+    with _erp_push_lock:
+        if _history_blocks_heartbeat():
+            logger.info(
+                f"HEARTBEAT device {device_id} cancelled; "
+                f"a history pull started"
+            )
+            return
+        while not stop_event.is_set():
+            try:
+                pending = queue.count_unsynced_through(device_id, machine_time)
+            except Exception as exc:
+                logger.error(
+                    f"HEARTBEAT device {device_id} count failed: {exc}"
+                )
+                return
+            if pending == 0:
+                break
+            status, count, err = _push_through_batch(device_id, machine_time)
+            if status == "fail":
+                logger.error(
+                    f"❌ Sync failed (device {device_id} heartbeat, "
+                    f"pending={pending}): {err}"
+                )
+                logger.warning(
+                    f"HEARTBEAT device {device_id} held at {machine_time}; "
+                    f"{pending} punch(es) still not on the ERP"
+                )
+                return
+            if status == "empty":
+                logger.warning(
+                    f"HEARTBEAT device {device_id} held at {machine_time}; "
+                    f"{pending} punch(es) still not on the ERP"
+                )
+                return
+        else:
+            return
+        try:
+            pending = queue.count_unsynced_through(device_id, machine_time)
+        except Exception as exc:
+            logger.error(
+                f"HEARTBEAT device {device_id} count failed: {exc}"
+            )
+            return
+        if pending:
+            logger.warning(
+                f"HEARTBEAT device {device_id} held at {machine_time}; "
+                f"{pending} punch(es) at or before that time still not on the ERP"
+            )
+            return
+        logger.info(
+            f"HEARTBEAT device {device_id} clear pending_at_or_before=0 "
+            f"through {machine_time}; posting"
+        )
+        ok, err = _post_device_heartbeat(device_id, ip, machine_time)
+
+    if ok:
+        logger.info(
+            f"HEARTBEAT device {device_id} OK machine_time={machine_time} "
+            f"ip={ip or '-'}"
+        )
+    else:
+        logger.error(f"HEARTBEAT device {device_id} rejected: {err}")
+
+
+def device_heartbeat_loop(stop_event: threading.Event) -> None:
+    """Report each terminal's clock after its older punches are on the ERP."""
+    logger.info(
+        f"HEARTBEAT started every {DEVICE_HEARTBEAT_S}s url={DEVICE_SYNC_ENDPOINT}"
+    )
+    stop_event.wait(15)
+    deferred_logged = False
+    while not stop_event.is_set():
+        started = time.monotonic()
+        if _history_blocks_heartbeat():
+            if not deferred_logged:
+                logger.info(
+                    "HEARTBEAT waiting; history pull has the terminals"
+                )
+                deferred_logged = True
+            stop_event.wait(15)
+            continue
+        deferred_logged = False
+        logger.info(f"HEARTBEAT cycle start devices={len(DEVICES)}")
+        for device in DEVICES:
+            if stop_event.is_set():
+                break
+            try:
+                _heartbeat_one_device(device, stop_event)
+            except Exception as exc:
+                logger.exception(
+                    f"HEARTBEAT device {device.get('device_id')} error: {exc}"
+                )
+        remaining = DEVICE_HEARTBEAT_S - (time.monotonic() - started)
+        if remaining > 0:
+            stop_event.wait(remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1424,7 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
     backoff = 5
     failures = 0
     outage_since: Optional[float] = None
+    clock_served: Dict[str, str] = {"token": ""}
     while not stopping["flag"]:
         if _orphaned():
             sub_logger.warning(
@@ -1041,22 +1465,37 @@ def capture_real_time_logs(device: dict, db_path: str) -> None:
                 if attendance is None:
                     if _orphaned():
                         break
-                    continue
-                record = _record_from_zk(attendance, device_id)
-                if record is None:
-                    sub_logger.warning(
-                        f"⚠️ [device {device_id}] skip malformed attendance"
-                    )
-                    continue
-                try:
-                    if local_queue.enqueue_one(record):
-                        sub_logger.info(
-                            f"🕘 [device {device_id}] punch user="
-                            f"{record['user_id']} @ {record['timestamp']}"
+                else:
+                    record = _record_from_zk(attendance, device_id)
+                    if record is None:
+                        sub_logger.warning(
+                            f"⚠️ [device {device_id}] skip malformed attendance"
                         )
-                except Exception as exc:
-                    sub_logger.error(
-                        f"❌ [device {device_id}] enqueue failed: {exc}"
+                    else:
+                        try:
+                            if local_queue.enqueue_one(record):
+                                sub_logger.info(
+                                    f"🕘 [device {device_id}] punch user="
+                                    f"{record['user_id']} @ {record['timestamp']}"
+                                )
+                        except Exception as exc:
+                            sub_logger.error(
+                                f"❌ [device {device_id}] enqueue failed: {exc}"
+                            )
+                # Answer after any punch is queued. During a rush, check at
+                # most every 2s so the ping is not stuck waiting for an idle gap.
+                now_mono = time.monotonic()
+                if (
+                    attendance is None
+                    or now_mono - float(clock_served.get("checked") or 0) >= 2
+                ):
+                    clock_served["checked"] = str(now_mono)
+                    _publish_device_clock_if_requested(
+                        conn,
+                        local_queue,
+                        device_id,
+                        clock_served,
+                        sub_logger,
                     )
             if not stopping["flag"] and not _orphaned():
                 raise ConnectionError("live capture stream ended")
@@ -1731,6 +2170,16 @@ def main() -> None:
     )
     pusher.start()
 
+    heartbeat = None
+    if DEVICE_HEARTBEAT_S > 0:
+        heartbeat = threading.Thread(
+            target=device_heartbeat_loop,
+            args=(stop_event,),
+            name="device-heartbeat",
+            daemon=True,
+        )
+        heartbeat.start()
+
     processes: Dict[Any, Process] = {}
     supervise_processes(processes)
 
@@ -1911,6 +2360,11 @@ def main() -> None:
             pusher.join(timeout=10)
         except Exception:
             pass
+        if heartbeat is not None:
+            try:
+                heartbeat.join(timeout=5)
+            except Exception:
+                pass
         try:
             stats = queue.stats()
         except Exception:

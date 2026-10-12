@@ -546,6 +546,54 @@ class AttendanceQueue:
                 ).fetchone()[0]
             )
 
+    def fetch_unsynced_through(
+        self, device_id: int, through_ts: str, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """Unsynced punches for one device at or before ``through_ts``.
+
+        ``through_ts`` is ``YYYY-MM-DD HH:MM:SS`` (the device clock). Rows
+        with a blank timestamp are included: their age cannot be proven.
+        """
+        limit = max(1, int(limit))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, device_id, user_id, timestamp, status, punch
+                  FROM attendance_queue
+                 WHERE synced = 0
+                   AND device_id = ?
+                   AND (
+                        timestamp <= ?
+                        OR timestamp IS NULL
+                        OR timestamp = ''
+                   )
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?;
+                """,
+                (int(device_id), str(through_ts), limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_unsynced_through(self, device_id: int, through_ts: str) -> int:
+        """How many unsynced punches for this device are at or before ``through_ts``."""
+        with self._conn() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM attendance_queue
+                     WHERE synced = 0
+                       AND device_id = ?
+                       AND (
+                            timestamp <= ?
+                            OR timestamp IS NULL
+                            OR timestamp = ''
+                       );
+                    """,
+                    (int(device_id), str(through_ts)),
+                ).fetchone()[0]
+            )
+
     def count_synced(self) -> int:
         with self._conn() as conn:
             return int(
