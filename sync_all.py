@@ -33,6 +33,7 @@ from typing import Iterable, List, Optional
 import httpx
 from zk import ZK
 
+from zk_compat import tolerate_impossible_zk_dates
 from storage import (
     DEFAULT_DB_PATH,
     AttendanceQueue,
@@ -276,6 +277,7 @@ def collect_device_logs(device: dict) -> Optional[List[dict]]:
             logging.error(f"[{dev_id}] connect() returned None")
             return None
 
+        tolerate_impossible_zk_dates(conn, dev_id)
         progress(
             f"   → Connected. Downloading ALL punches stored on device "
             f"(not just 7/60 days — device protocol limitation)..."

@@ -108,6 +108,37 @@ def wait_for_network(max_wait_s: int = 120) -> bool:
     return False
 
 
+def daemon_already_running(project_dir: str) -> int:
+    """PID of ``main.py`` already serving this directory, else 0.
+
+    This host also starts ``attendance-boot-sync-30d`` from PM2. That
+    second pull opens the same terminals the daemon is using and the
+    single-session device answers with connection reset.
+    """
+    proc_root = "/proc"
+    if not os.path.isdir(proc_root):
+        return 0
+    project_dir = os.path.realpath(project_dir)
+    me = os.getpid()
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        try:
+            cwd = os.path.realpath(os.readlink(f"{proc_root}/{pid}/cwd"))
+            if cwd != project_dir:
+                continue
+            raw = open(f"{proc_root}/{pid}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        cmd = [part.decode(errors="replace") for part in raw if part]
+        if any(os.path.basename(part) == "main.py" for part in cmd):
+            return pid
+    return 0
+
+
 def resolve_python(project_dir: str) -> str:
     """Prefer the project's venv interpreter; fall back to current."""
     candidates = [
@@ -157,6 +188,15 @@ def main() -> None:
         sys.exit(1)
 
     python_bin = resolve_python(project_dir)
+
+    daemon_pid = daemon_already_running(project_dir)
+    if daemon_pid:
+        logger.info(
+            f"Attendance daemon is already running (pid {daemon_pid}) "
+            f"and pulls the last {boot_sync_days} days itself. "
+            f"Skipping this boot sync so the terminals are not opened twice."
+        )
+        sys.exit(0)
 
     logger.info(f"Boot sync range: {from_date} -> {to_date}")
     logger.info(f"CWD: {project_dir}")
